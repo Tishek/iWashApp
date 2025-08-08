@@ -9,17 +9,19 @@
     "web": "expo start --web"
   },
   "dependencies": {
-    "expo": "~53.0.20",
-    "expo-status-bar": "~2.2.3",
-    "react": "19.0.0",
-    "react-native": "0.79.5",
-    "react-native-maps": "1.20.1",
-    "expo-location": "~18.1.6",
-    "@react-native-community/slider": "4.5.6",
     "@react-native-async-storage/async-storage": "2.1.2",
+    "@react-native-community/slider": "4.5.6",
+    "expo": "~53.0.20",
     "expo-blur": "~14.1.5",
     "expo-haptics": "~14.1.4",
-    "expo-updates": "~0.28.17"
+    "expo-location": "~18.1.6",
+    "expo-status-bar": "~2.2.3",
+    "expo-updates": "~0.28.17",
+    "react": "19.0.0",
+    "react-native": "0.79.5",
+    "react-native-map-clustering": "^4.0.0",
+    "react-native-maps": "1.20.1",
+    "react-native-safe-area-context": "5.4.0"
   },
   "devDependencies": {
     "@babel/core": "^7.20.0"

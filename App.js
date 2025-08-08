@@ -20,19 +20,37 @@ import {
   Image,
 } from 'react-native';
 import MapView, { Marker, PROVIDER_DEFAULT, Circle } from 'react-native-maps';
+import ClusteredMapView from 'react-native-map-clustering';
 import * as Location from 'expo-location';
 import Slider from '@react-native-community/slider';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { BlurView } from 'expo-blur';
 import * as Haptics from 'expo-haptics';
+import { SafeAreaProvider, useSafeAreaInsets, initialWindowMetrics } from 'react-native-safe-area-context';
 
 const { width: SCREEN_W, height: SCREEN_H } = Dimensions.get('window');
 const ITEM_H = 112; // odhad výšky karty + separator
 
-const MIN_M = 1000;  // 1 km
+const MIN_M = 500;   // 0.5 km
 const MAX_M = 5000;  // 5 km
 const STEP_M = 100;
 const MAX_RESULTS = 60;
+const PIN_ANCHOR_Y = 18; // px – souřadnice markeru je ve špičce, tím dorovnáme kolečko do středu
+const PIN_SELECTED_SCALE = 1.35; // scale vybraného pinu – používej všude stejnou hodnotu
+// Výška pin view v základním měřítku (px). Použije se pro kompenzaci posunu při scale animaci,
+// aby špička pinu (anchor) zůstala na stejném místě.
+const PIN_BASE_H = 28;
+
+// Geometrie pinu (musí odpovídat stylům níže)
+const PIN_TOP_H = 18;         // styles.pinTop.height
+const PIN_STEM_H = 10;        // styles.pinStem.height
+const PIN_STEM_MARGIN = 1;    // styles.pinStem.marginTop
+// Základní vzdálenost od anchoru (spodku) k centru kruhu v měřítku 1.0
+const PIN_ANCHOR_OFFSET_BASE = PIN_STEM_H + PIN_STEM_MARGIN + PIN_TOP_H / 2; // = 20 px
+
+// Cílová výška viditelné mapy v metrech po kliknutí na myčku (laditelné)
+const TARGET_VISIBLE_SPAN_M = 1000; // např. ~1.4 km vertikálně
+const METERS_PER_DEGREE_LAT = 111320; // ~m na 1° zeměpisné šířky
 
 const API_KEY = process.env.EXPO_PUBLIC_GOOGLE_MAPS_API_KEY;
 
@@ -46,6 +64,7 @@ const DEFAULT_SETTINGS = {
 };
 const SETTINGS_KEY = 'iwash_settings_v1';
 const FAVORITES_KEY = 'iwash_favorites_v1';
+const FAVORITES_DATA_KEY = 'iwash_favorites_data_v1';
 
 // haversine v metrech
 function distanceMeters(a, b) {
@@ -115,10 +134,30 @@ const TYPE_LABEL = {
 const OVERRIDE_FULL = ['kk detail','solid car wash','solid carwash','mobilewash'];
 const OVERRIDE_EXCLUDE = ['auto podbabska','autopodbabska'];
 
-export default function App() {
+function AppInner() {
   const mapRef = useRef(null);
   const listRef = useRef(null);
   const pendingFocusCoordRef = useRef(null);
+  const pendingFocusScaleRef = useRef(1); // 1 = normální pin, 1.35 = vybraný pin
+  // Guard to avoid setState loops while we animate the map
+  const isAnimatingRef = useRef(false);
+  const animTimerRef = useRef(null);
+  const animateToRegionSafe = (r, d = 280) => {
+    if (!mapRef.current) return;
+    isAnimatingRef.current = true;
+    try { mapRef.current.animateToRegion(r, d); } catch {}
+    if (animTimerRef.current) clearTimeout(animTimerRef.current);
+    animTimerRef.current = setTimeout(() => { isAnimatingRef.current = false; }, d + 80);
+  };
+
+  // Safe-area insets (notch)
+  const insets = useSafeAreaInsets();
+  // Prevent multiple centerings from stacking
+  const centerLockRef = useRef(false);
+  // de-dupe opakovaných centerů na stejný cíl
+  const lastCenterRef = useRef({ key: '', ts: 0 });
+  // počkej na vykreslení (řeší coordinateForPoint hned po animaci)
+  const afterPaint = () => new Promise(r => requestAnimationFrame(r));
 
   const systemScheme = useColorScheme();
 
@@ -129,6 +168,19 @@ export default function App() {
   const [region, setRegion] = useState(null);
   const [coords, setCoords] = useState(null);
 
+  // Nejvyšší Y (spodní hrana) top UI, které překrývá mapu (top pill, status pill)
+  const [topUiBottomY, setTopUiBottomY] = useState(0);
+  const registerTopOcclusion = (e) => {
+    const ly = e?.nativeEvent?.layout;
+    if (!ly) return;
+    const bottom = (ly.y || 0) + (ly.height || 0);
+    setTopUiBottomY(prev => Math.max(prev, bottom));
+  };
+
+  // držíme poslední region pro porovnání a odfiltrování mikroskopických změn
+  const regionRef = useRef(null);
+  useEffect(() => { regionRef.current = region; }, [region]);
+
   // radius (m)
   const [radiusM, setRadiusM] = useState(DEFAULT_SETTINGS.defaultRadiusM);
   const [radiusText, setRadiusText] = useState(String(DEFAULT_SETTINGS.defaultRadiusM));
@@ -138,9 +190,21 @@ export default function App() {
   const [loading, setLoading] = useState(false);
   const [lastError, setLastError] = useState(null);
   const [selectedId, setSelectedId] = useState(null);
+  // Dynamicky změřená výška pinu (kvůli přesné kompenzaci scale)
+  const [pinBaseHState, setPinBaseHState] = useState(PIN_BASE_H);
 
   // favorites (persistováno v AsyncStorage)
   const [favorites, setFavorites] = useState({}); // { [place_id]: true }
+
+  // uložená data oblíbených (aby byly vidět i mimo radius)
+  const [favoritesData, setFavoritesData] = useState({}); // { [id]: snapshot }
+
+  // sledování polohy – follow me
+  const [followMe, setFollowMe] = useState(true);
+  const locSubRef = useRef(null);
+  const followRef = useRef(followMe);
+  useEffect(() => { followRef.current = followMe; }, [followMe]);
+  const disableFollow = () => { followRef.current = false; setFollowMe(false); };
 
   // auto reload (zrcadlí settings.autoReload)
   const [autoReload, setAutoReload] = useState(DEFAULT_SETTINGS.autoReload);
@@ -161,6 +225,13 @@ export default function App() {
   const prevSelectedRef = useRef(null);
   const animateSelect = (nextId) => {
     const prevId = prevSelectedRef.current;
+
+    // If the same pin is tapped again, do nothing (prevents shrink→grow bounce)
+    if (prevId && nextId && prevId === nextId) {
+      return;
+    }
+
+    // Shrink previously selected pin back to 1
     if (prevId && pinScales.current[prevId]) {
       Animated.spring(pinScales.current[prevId], {
         toValue: 1,
@@ -169,14 +240,17 @@ export default function App() {
         tension: 120,
       }).start();
     }
+
+    // Grow the newly selected pin to highlighted scale
     if (nextId && pinScales.current[nextId]) {
       Animated.spring(pinScales.current[nextId], {
-        toValue: 1.35,
+        toValue: PIN_SELECTED_SCALE,
         useNativeDriver: true,
         friction: 6,
         tension: 120,
       }).start();
     }
+
     prevSelectedRef.current = nextId || null;
   };
   useEffect(() => {
@@ -215,6 +289,16 @@ export default function App() {
     })();
   }, []);
 
+    // --- Favorites DATA load ---
+  useEffect(() => {
+    (async () => {
+      try {
+        const raw = await AsyncStorage.getItem(FAVORITES_DATA_KEY);
+        if (raw) setFavoritesData(JSON.parse(raw));
+      } catch {}
+    })();
+  }, []);
+
   const saveSettings = async (patch) => {
     setSettings(prev => {
       const next = { ...prev, ...patch };
@@ -224,11 +308,34 @@ export default function App() {
   };
 
   const isFav = (id) => !!favorites[id];
-  const toggleFav = (item) => {
+    const toggleFav = (item) => {
     setFavorites(prev => {
       const next = { ...prev };
-      if (next[item.id]) delete next[item.id]; else next[item.id] = true;
+      const exists = !!next[item.id];
+      if (exists) delete next[item.id]; else next[item.id] = true;
       AsyncStorage.setItem(FAVORITES_KEY, JSON.stringify(next)).catch(() => {});
+
+      setFavoritesData(prevData => {
+        const dataNext = { ...prevData };
+        if (exists) {
+          delete dataNext[item.id];
+        } else {
+          dataNext[item.id] = {
+            id: item.id,
+            name: item.name,
+            address: item.address,
+            location: item.location,
+            inferredType: item.inferredType,
+            rating: item.rating,
+            userRatingsTotal: item.userRatingsTotal ?? 0,
+            openNow: (typeof item.openNow === 'boolean') ? item.openNow : null,
+            distanceM: item.distanceM ?? null,
+          };
+        }
+        AsyncStorage.setItem(FAVORITES_DATA_KEY, JSON.stringify(dataNext)).catch(() => {});
+        return dataNext;
+      });
+
       return next;
     });
   };
@@ -261,10 +368,45 @@ export default function App() {
     })();
   }, []);
 
+  // živé sledování polohy
+  useEffect(() => {
+    let sub = null;
+    (async () => {
+      if (!hasPermission) return;
+      try {
+        sub = await Location.watchPositionAsync(
+          {
+            accuracy: Location.Accuracy.High,
+            timeInterval: 4000,
+            distanceInterval: 10,
+          },
+          (loc) => {
+            const next = { latitude: loc.coords.latitude, longitude: loc.coords.longitude };
+            setCoords(next);
+            if (followRef.current && mapRef.current) {
+              animateToRegionSafe({
+                ...next,
+                latitudeDelta: region?.latitudeDelta ?? 0.02,
+                longitudeDelta: region?.longitudeDelta ?? 0.02,
+              }, 350);
+            }
+          }
+        );
+        locSubRef.current = sub;
+      } catch {}
+    })();
+    return () => {
+      try { sub?.remove?.(); } catch {}
+      locSubRef.current = null;
+    };
+  }, [hasPermission]);
+
   const recenter = () => {
     Haptics.selectionAsync();
+    // explicit recenter enables follow
+    setFollowMe(true);
     if (mapRef.current && coords) {
-      mapRef.current.animateToRegion({ ...coords, latitudeDelta: 0.02, longitudeDelta: 0.02 }, 450);
+      animateToRegionSafe({ ...coords, latitudeDelta: 0.02, longitudeDelta: 0.02 }, 450);
     }
   };
 
@@ -278,6 +420,15 @@ export default function App() {
     setRadiusM(v);
     setRadiusText(String(v));
   };
+
+  // cluster radius v pixelech – čím víc přiblíženo, tím menší radius
+  const clusterRadiusPx = useMemo(() => {
+    if (!region) return 60;
+    const zoom = Math.log2(360 / (region.latitudeDelta || 1)); // ~1–20
+    // víc zoomu => menší radius
+    const r = Math.round(80 - zoom * 4);
+    return clamp(r, 18, 72);
+  }, [region]);
   const dec = () => commitRadius(radiusM - STEP_M);
   const inc = () => commitRadius(radiusM + STEP_M);
   const onTextChange = (t) => setRadiusText(t.replace(/[^\d]/g, ''));
@@ -297,31 +448,85 @@ export default function App() {
     saveSettings({ defaultRadiusM: next });
   };
 
-  // Pomocník: posuň mapu tak, aby zadaná souřadnice byla uprostřed VIDITELNÉ mapy
-  const moveMarkerToVisibleCenter = async (coord) => {
+  // Pomocník: posuň mapu tak, aby byl pin uprostřed VIDITELNÉ mapy (mezi notchem a listem)
+  const VIEW_TOLERANCE_PX = 12; // když je pin v ±12 px od cíle, už neanimujeme
+
+  const moveMarkerToVisibleCenter = async (coord, opts = {}) => {
     if (!mapRef.current || !region || !coord) return;
-    const targetH = isExpanded ? SNAP_EXPANDED : SNAP_COLLAPSED;
-    const visibleCenterY = (SCREEN_H - targetH) / 2;
-    try {
-      // Souřadnice aktuálního "viditelného středu" (v pixelech uprostřed šířky, nad sheetem)
-      const visCoord = await mapRef.current.coordinateForPoint({ x: SCREEN_W / 2, y: visibleCenterY });
-      const latDiff = (coord.latitude) - (visCoord?.latitude ?? region.latitude);
-      const newRegion = {
-        ...region,
-        latitude: region.latitude + latDiff,
-        longitude: coord.longitude,
-      };
-      mapRef.current.animateToRegion(newRegion, 280);
-    } catch (e) {
-      // Fallback bez coordinateForPoint – odhad podle výšky sheetu
-      const offsetLat = (region.latitudeDelta * ( (isExpanded ? SNAP_EXPANDED : SNAP_COLLAPSED) / SCREEN_H )) / 2;
-      const newRegion = {
-        ...region,
-        latitude: coord.latitude - offsetLat,
-        longitude: coord.longitude,
-      };
-      mapRef.current.animateToRegion(newRegion, 280);
+
+    const { zoomFactor = 0.7, minDelta = 0.01, pinScale = 1, targetSpanM = null } = opts;
+
+    // de-dupe: stejná cílová souřadnice + stejný stav listu + stejná scale krátce po sobě
+    const now = Date.now();
+    const key = `${coord.latitude.toFixed(6)},${coord.longitude.toFixed(6)}|${isExpanded ? 1 : 0}|${pinScale}`;
+    if (lastCenterRef.current?.key === key && now - lastCenterRef.current.ts < 600) return;
+    lastCenterRef.current = { key, ts: now };
+
+    // throttle proti řetězení
+    if (centerLockRef.current) return;
+    centerLockRef.current = true;
+    setTimeout(() => { centerLockRef.current = false; }, 450);
+
+    const sheetHNow = isExpanded ? SNAP_EXPANDED : SNAP_COLLAPSED;
+    const topSafe = insets?.top || 0;
+    const topOcclusion = Math.max(topSafe, topUiBottomY); // započti překryv top UI
+
+    // Cíl: zobrazit PIN přesně uprostřed VIDITELNÉ mapy (mezi top UI a listem)
+    const EXTRA_CLEAR_PX = 0; // přesné centrování
+    const desiredCenterY = topOcclusion + (SCREEN_H - topOcclusion - sheetHNow) / 2;
+    const desiredY = desiredCenterY + EXTRA_CLEAR_PX; // míříme na střed vizuální plochy
+
+    // počkej na vykreslení, ať coordinate/point převody sedí
+    await new Promise(r => requestAnimationFrame(r));
+
+    const currentLatDelta = region.latitudeDelta || 0.02;
+    const currentLonDelta = region.longitudeDelta || 0.02;
+
+    let nextLatDelta = Math.max(minDelta, currentLatDelta * zoomFactor);
+    let nextLonDelta = Math.max(minDelta, currentLonDelta * zoomFactor);
+
+    // Pokud je zadán cílový rozsah v metrech pro VIDITELNOU výšku mapy, spočti delty deterministicky
+    if (targetSpanM && targetSpanM > 0) {
+      const visibleH = Math.max(1, SCREEN_H - Math.max(insets?.top || 0, topUiBottomY) - sheetHNow); // px
+      const scaleFactor = SCREEN_H / visibleH; // MapView region se vztahuje na celé okno, ne jen viditelnou část
+      const latDeltaForVisible = (targetSpanM / METERS_PER_DEGREE_LAT) * scaleFactor;
+      nextLatDelta = Math.max(minDelta, latDeltaForVisible);
+      const aspect = SCREEN_W / SCREEN_H; // poměr pro celé okno MapView
+      nextLonDelta = Math.max(minDelta, nextLatDelta * aspect);
     }
+
+    // Zjisti, jestli už jsme prakticky přesně ve středu (± tolerance)
+    let centered = false;
+    try {
+      const pt = await mapRef.current.pointForCoordinate(coord);
+      if (pt) {
+        const dx = Math.abs(pt.x - SCREEN_W / 2);
+        const dy = Math.abs(pt.y - desiredY);
+        centered = dx <= VIEW_TOLERANCE_PX && dy <= VIEW_TOLERANCE_PX;
+      }
+    } catch {}
+
+    const needZoom =
+      Math.abs(currentLatDelta - nextLatDelta) > 1e-6 ||
+      Math.abs(currentLonDelta - nextLonDelta) > 1e-6;
+
+    if (centered && !needZoom) return;
+
+    // Deterministicky spočítej cílový region na základě CÍLOVÉ delty, bez závislosti na aktuálním zoomu
+    const effectiveLatDelta = needZoom ? nextLatDelta : currentLatDelta;
+    const effectiveLonDelta = needZoom ? nextLonDelta : currentLonDelta;
+    const pixelDeltaY = desiredY - SCREEN_H / 2; // posun od středu obrazovky v pixelech
+    const degPerPxLat = effectiveLatDelta / SCREEN_H;
+    const targetLatitude = coord.latitude - pixelDeltaY * degPerPxLat;
+    const targetLongitude = coord.longitude; // horizontálně chceme střed, takže stačí střed = long cíle
+
+    animateToRegionSafe({
+      ...region,
+      latitude: targetLatitude,
+      longitude: targetLongitude,
+      latitudeDelta: effectiveLatDelta,
+      longitudeDelta: effectiveLonDelta,
+    }, 300);
   };
 
   // BottomSheet
@@ -336,40 +541,20 @@ export default function App() {
     Animated.spring(sheetH, { toValue: isExpanded ? SNAP_EXPANDED : SNAP_COLLAPSED, useNativeDriver: false, friction: 9, tension: 80 }).start();
   }, [isExpanded]);
 
-  // posuň střed mapy na střed viditelné oblasti (kvůli překrytí sheetem)
-  const lastCenterAdjust = useRef(null);
+  // Když se list otevře a máme naplánované zarovnání (např. po vyhledání nebo tapu na pin),
+  // dorovnáme mapu tak, aby bod byl uprostřed viditelné mapy. Jinak nic neděláme (žádné auto-posouvání).
   useEffect(() => {
-    (async () => {
-      if (!mapRef.current || !region) return;
-      const targetH = isExpanded ? SNAP_EXPANDED : SNAP_COLLAPSED;
-      const mode = isExpanded ? 'expanded' : 'collapsed';
-
-      // Pokud rozbalujeme a máme čekající pin, zarovnej nejdřív ten (jediná animace)
-      if (isExpanded && pendingFocusCoordRef.current) {
-        const coord = pendingFocusCoordRef.current;
-        pendingFocusCoordRef.current = null;
-        await moveMarkerToVisibleCenter(coord);
-        lastCenterAdjust.current = mode;
-        return;
-      }
-
-      if (lastCenterAdjust.current === mode) return;
-      lastCenterAdjust.current = mode;
-
-      const visibleCenterY = (SCREEN_H - targetH) / 2;
-      try {
-        const centerCoord = await mapRef.current.coordinateForPoint({ x: SCREEN_W / 2, y: SCREEN_H / 2 });
-        const visCoord    = await mapRef.current.coordinateForPoint({ x: SCREEN_W / 2, y: visibleCenterY });
-        const latDiff = (centerCoord?.latitude ?? region.latitude) - (visCoord?.latitude ?? region.latitude);
-        const newRegion = { ...region, latitude: region.latitude - latDiff };
-        mapRef.current.animateToRegion(newRegion, 250);
-      } catch (e) {
-        const offsetLat = (region.latitudeDelta * (targetH / SCREEN_H)) / 2;
-        const newRegion = { ...region, latitude: region.latitude - offsetLat };
-        mapRef.current.animateToRegion(newRegion, 250);
-      }
-    })();
-  }, [isExpanded, region]);
+  if (!isExpanded) return;
+  const coord = pendingFocusCoordRef.current;
+  if (coord) {
+    pendingFocusCoordRef.current = null;
+    setTimeout(() => {
+      // po dojetí listu centrovat (počítej zvětšený pin)
+      moveMarkerToVisibleCenter(coord, { zoomFactor: 0.7, minDelta: 0.01, pinScale: pendingFocusScaleRef.current || 1, targetSpanM: TARGET_VISIBLE_SPAN_M });
+      pendingFocusScaleRef.current = 1;
+    }, 320);
+  }
+}, [isExpanded]);
 
   const km = (radiusM / 1000).toFixed(1);
 
@@ -457,17 +642,13 @@ export default function App() {
       const items = acc.sort((a, b) => a.distanceM - b.distanceM);
       setPlaces(items);
 
-      if (mapRef.current && items.length > 0) {
-        mapRef.current.animateToRegion(
-          {
-            latitude: searchCenter.latitude,
-            longitude: searchCenter.longitude,
-            latitudeDelta: Math.max(0.01, region?.latitudeDelta ?? 0.02),
-            longitudeDelta: Math.max(0.01, region?.longitudeDelta ?? 0.02)
-          },
-          400
-        );
-      }
+      // Po vyhledání a otevření listu zarovnej viditelný střed na mou polohu (nebo střed vyhledávání)
+      const focusCoord = (settings.searchFrom === 'myLocation' && coords)
+        ? coords
+        : { latitude: searchCenter.latitude, longitude: searchCenter.longitude };
+
+      pendingFocusCoordRef.current = focusCoord;
+      pendingFocusScaleRef.current = 1;
 
       setIsExpanded(true);
     } catch (e) {
@@ -493,11 +674,21 @@ export default function App() {
     return () => clearTimeout(autoDebounce.current);
   }, [region, radiusM, autoReload, searchCenter]);
 
-  const filteredPlaces = useMemo(() => {
+    const filteredPlaces = useMemo(() => {
     if (filterMode === 'ALL') return places;
-    if (filterMode === 'FAV') return places.filter(p => isFav(p.id));
+    if (filterMode === 'FAV') {
+      const inRadius = places.filter(p => isFav(p.id));
+      const stored = Object.values(favoritesData || {});
+      const extra = stored
+        .filter(s => !inRadius.some(ir => ir.id === s.id))
+        .map(s => ({
+          ...s,
+          distanceM: searchCenter ? Math.round(distanceMeters(searchCenter, s.location)) : (s.distanceM ?? Number.MAX_SAFE_INTEGER),
+        }));
+      return [...inRadius, ...extra].sort((a, b) => (a.distanceM ?? 0) - (b.distanceM ?? 0));
+    }
     return places.filter(p => p.inferredType === filterMode);
-  }, [places, filterMode, favorites]);
+  }, [places, filterMode, favorites, favoritesData, searchCenter]);
 
   const idToIndex = useMemo(() => {
     const m = {};
@@ -509,70 +700,141 @@ export default function App() {
 
   const focusPlace = async (p) => {
     Haptics.selectionAsync();
-    setSelectedId(p.id);
-    if (!mapRef.current || !p?.location) return;
+    disableFollow();
+    setSelectedId((prev) => (prev === p.id ? prev : p.id));
+    if (!p?.location) return;
+
+    // Pokud už je vybraný stejný pin a list je otevřený, necentruj znovu
+    if (selectedId === p.id && isExpanded) {
+      // ale stále posuň seznam na kartu
+      const idx = idToIndex[p.id];
+      setTimeout(() => {
+        if (listRef.current != null && typeof idx === 'number') {
+          try {
+            listRef.current.scrollToIndex({ index: idx, animated: true, viewPosition: 0, viewOffset: sheetTopH + 8 });
+          } catch {
+            listRef.current.scrollToOffset({ offset: Math.max(ITEM_H * idx - sheetTopH, 0), animated: true });
+          }
+        }
+      }, 120);
+      return;
+    }
+
     if (isExpanded) {
-      await moveMarkerToVisibleCenter(p.location);
+      moveMarkerToVisibleCenter(p.location, { zoomFactor: 0.65, minDelta: 0.01, pinScale: PIN_SELECTED_SCALE, targetSpanM: TARGET_VISIBLE_SPAN_M });
     } else {
-      mapRef.current.animateToRegion({ latitude: p.location.latitude, longitude: p.location.longitude, latitudeDelta: 0.01, longitudeDelta: 0.01 }, 300);
+      pendingFocusCoordRef.current = p.location;
+      pendingFocusScaleRef.current = PIN_SELECTED_SCALE;
+      setIsExpanded(true);
     }
   };
 
   const onMarkerPress = (p) => {
+    // Pokud ťuknu na již vybraný pin a list je otevřený, nic nedělej
+    if (selectedId === p.id && isExpanded) {
+      return;
+    }
+    disableFollow();
     Haptics.selectionAsync();
-    setSelectedId(p.id);
-    // Označ, že po rozbalení chceme zarovnat právě tento pin
-    pendingFocusCoordRef.current = p?.location || null;
-    setIsExpanded(true);
+    setSelectedId((prev) => (prev === p.id ? prev : p.id));
 
+    if (isExpanded) {
+      // list je venku → centrovat hned (zvětšený pin)
+      moveMarkerToVisibleCenter(p.location, { zoomFactor: 0.7, minDelta: 0.01, pinScale: PIN_SELECTED_SCALE, targetSpanM: TARGET_VISIBLE_SPAN_M });
+    } else {
+      // list je dole → otevři a dopočítej po animaci
+      pendingFocusCoordRef.current = p.location || null;
+      pendingFocusScaleRef.current = PIN_SELECTED_SCALE;
+      setIsExpanded(true);
+    }
+
+    // posuň list na kartu
     const idx = idToIndex[p.id];
-    // Počkej chvilku, ať se sheet rozjede, a pak posuň list na položku (mapu už řeší useEffect výše)
     setTimeout(() => {
       if (listRef.current != null && typeof idx === 'number') {
         try {
           listRef.current.scrollToIndex({ index: idx, animated: true, viewPosition: 0, viewOffset: sheetTopH + 8 });
-        } catch (_e) {
+        } catch {
           listRef.current.scrollToOffset({ offset: Math.max(ITEM_H * idx - sheetTopH, 0), animated: true });
         }
       }
-    }, 300);
+    }, isExpanded ? 120 : 320);
   };
 
-  const openNavigation = (p, app) => {
-    const { latitude, longitude } = p.location;
-    const nameEncoded = encodeURIComponent(p.name || 'Car Wash');
-    let url = '';
-    if (app === 'apple') url = `http://maps.apple.com/?daddr=${latitude},${longitude}&q=${nameEncoded}`;
-    else if (app === 'google') url = `https://www.google.com/maps/dir/?api=1&destination=${latitude},${longitude}&travelmode=driving`;
-    else if (app === 'waze') url = `https://waze.com/ul?ll=${latitude},${longitude}&navigate=yes`;
-    Linking.openURL(url).catch(() => Alert.alert('Nelze otevřít', 'Zkuste jinou navigaci.'));
-  };
-  const onNavigatePreferred = (p) => {
-    const pref = settings.preferredNav || 'ask';
-    if (pref === 'ask') {
-      Alert.alert('Navigovat', 'Vyber aplikaci', [
-        { text: 'Apple',  onPress: () => openNavigation(p, 'apple') },
-        { text: 'Google', onPress: () => openNavigation(p, 'google') },
-        { text: 'Waze',   onPress: () => openNavigation(p, 'waze') },
-        { text: 'Zrušit', style: 'cancel' },
-      ]);
-    } else {
-      openNavigation(p, pref);
-    }
+  const renderCluster = (cluster, _onPress) => {
+    const { id, geometry, properties } = cluster;
+    const [longitude, latitude] = geometry.coordinates;
+    const count = properties.point_count;
+
+    const handlePress = () => {
+      try { Haptics.selectionAsync(); } catch {}
+      disableFollow();
+      if (isExpanded) {
+        // list is open → center into the visible area (avoid notch and sheet)
+        moveMarkerToVisibleCenter({ latitude, longitude }, { zoomFactor: 0.65, minDelta: 0.01 });
+      } else {
+        // list is closed → do a manual zoom-in around cluster center
+        const latDelta = Math.max(0.006, (region?.latitudeDelta || 0.04) * 0.6);
+        const lonDelta = Math.max(0.006, (region?.longitudeDelta || 0.04) * 0.6);
+        animateToRegionSafe({ latitude, longitude, latitudeDelta: latDelta, longitudeDelta: lonDelta }, 260);
+      }
+    };
+
+    return (
+      <Marker key={`cluster-${id}`} coordinate={{ latitude, longitude }} onPress={handlePress} tracksViewChanges={false}>
+        <View style={styles.clusterWrap}>
+          <Text style={styles.clusterText}>{count}</Text>
+        </View>
+      </Marker>
+    );
   };
 
   return (
-    <View style={[styles.container, { backgroundColor: P.bg }]}>    
+    <View style={[styles.container, { backgroundColor: P.bg }]}>
+      {/* Offscreen měření skutečné výšky pinu pro přesnou kompenzaci */}
+      <View
+        style={{ position: 'absolute', opacity: 0, left: -9999, top: -9999 }}
+        onLayout={(e) => {
+          const h = e?.nativeEvent?.layout?.height;
+          if (h && Math.abs(h - pinBaseHState) > 0.5) {
+            setPinBaseHState(h);
+          }
+        }}
+      >
+        <View style={styles.pinWrap}>
+          <View style={[styles.pinTop, { backgroundColor: '#000' }]} />
+          <View style={[styles.pinStem, { backgroundColor: '#000' }]} />
+        </View>
+      </View>
       {region && (
-        <MapView
+        <ClusteredMapView
           ref={mapRef}
           style={StyleSheet.absoluteFillObject}
           provider={PROVIDER_DEFAULT}
           initialRegion={region}
-          onRegionChangeComplete={setRegion}
+          onRegionChangeComplete={(r) => {
+            if (isAnimatingRef.current) return; // ignore updates caused by our own animateToRegion
+            const prev = regionRef.current;
+            if (prev) {
+              const dLat  = Math.abs((prev.latitude ?? 0)       - (r.latitude ?? 0));
+              const dLon  = Math.abs((prev.longitude ?? 0)      - (r.longitude ?? 0));
+              const dLatD = Math.abs((prev.latitudeDelta ?? 0)  - (r.latitudeDelta ?? 0));
+              const dLonD = Math.abs((prev.longitudeDelta ?? 0) - (r.longitudeDelta ?? 0));
+              // ignoruj mikrozměny, které vznikají během animací a mohou řetězit re-rendery
+              if (dLat < 1e-7 && dLon < 1e-7 && dLatD < 1e-7 && dLonD < 1e-7) return;
+            }
+            setRegion(r);
+          }}
+          onPanDrag={() => { disableFollow(); }}
           showsCompass={false}
           showsMyLocationButton={false}
           showsScale={false}
+          clusteringEnabled
+          spiralEnabled
+          radius={clusterRadiusPx}
+          extent={256}
+          // onClusterPress removed, handled in renderCluster
+          renderCluster={renderCluster}
         >
           {searchCenter && (
             <Circle
@@ -599,6 +861,8 @@ export default function App() {
                 onPress={() => onMarkerPress(p)}
                 tracksViewChanges={false}
                 zIndex={selectedId === p.id ? 999 : 1}
+                cluster={selectedId === p.id ? false : true}
+                anchor={{ x: 0.5, y: 0.5 }}
               >
                 <Animated.View style={[styles.pinWrap, { transform: [{ scale }] }]}>
                   {selectedId === p.id && <View style={[styles.pinGlow, { borderColor: color }]} />}
@@ -615,14 +879,20 @@ export default function App() {
           })}
 
           {coords && (
-            <Marker coordinate={coords} anchor={{ x: 0.5, y: 0.5 }} tracksViewChanges={false}>
+            <Marker
+              coordinate={coords}
+              cluster={false}          // ⬅️ NECLUSTROVAT
+              zIndex={9999}            // ať je nad bublinami
+              anchor={{ x: 0.5, y: 0.5 }}
+              tracksViewChanges={false}
+            >
               <View style={styles.meContainer}>
                 <Animated.View style={[styles.pulseRing, { transform: [{ scale: ringScale }], opacity: ringOpacity }]} />
                 <View style={styles.meDotShadow}><View style={styles.meDot} /></View>
               </View>
             </Marker>
           )}
-        </MapView>
+        </ClusteredMapView>
       )}
 
       {/* kříž – zobrazuj jen pokud se hledá od středu mapy */}
@@ -631,7 +901,7 @@ export default function App() {
       )}
 
       {/* horní pilulka */}
-      <BlurView intensity={50} tint={isDark ? 'dark' : 'light'} style={[styles.topPill, styles.glass]}> 
+      <BlurView intensity={50} tint={isDark ? 'dark' : 'light'} style={[styles.topPill, styles.glass]} onLayout={registerTopOcclusion}> 
         <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8 }}>
           <Image source={require('./assets/icon.png')} style={styles.brandIcon} />
           <Text style={[styles.topPillText, { color: P.text }]}>iWash</Text>
@@ -639,7 +909,7 @@ export default function App() {
       </BlurView>
 
       {/* status pilulka vpravo nahoře + ⚙︎ */}
-      <BlurView intensity={50} tint={isDark ? 'dark' : 'light'} style={[styles.statusPill, styles.glass]}> 
+      <BlurView intensity={50} tint={isDark ? 'dark' : 'light'} style={[styles.statusPill, styles.glass]} onLayout={registerTopOcclusion}> 
         {loading ? (
           <>
             <ActivityIndicator size="small" />
@@ -686,6 +956,22 @@ export default function App() {
           </BlurView>
         </View>
       )}
+
+      {/* Quick radius chips (right side, vertical) */}
+      <View pointerEvents="box-none" style={styles.quickChipsWrap}>
+        {[{km:0.5},{km:1},{km:3},{km:5}].map(({km})=>{
+          const m = Math.round(km*1000);
+          const active = radiusM === m;
+          return (
+            <TouchableOpacity key={m}
+              onPress={()=>{ Haptics.selectionAsync(); commitRadius(m); if (autoReload) searchHere(); }}
+              style={[styles.quickChip, active && styles.quickChipActive]}
+              accessibilityLabel={`Radius ${km} km`}>
+              <Text style={[styles.quickChipTxt, active && styles.quickChipTxtActive]}>{km} km</Text>
+            </TouchableOpacity>
+          );
+        })}
+      </View>
 
       {/* BottomSheet */}
       <Animated.View
@@ -953,6 +1239,14 @@ export default function App() {
   );
 }
 
+export default function App() {
+  return (
+    <SafeAreaProvider initialMetrics={initialWindowMetrics}>
+      <AppInner />
+    </SafeAreaProvider>
+  );
+}
+
 const styles = StyleSheet.create({
   container: { flex: 1 },
 
@@ -1155,4 +1449,15 @@ const styles = StyleSheet.create({
   segRow: { flexDirection: 'row', gap: 8 },
   segBtn: { paddingHorizontal: 12, paddingVertical: 8, borderRadius: 999 },
   segTxt: { fontSize: 12, fontWeight: '800' },
+
+  // clusters
+  clusterWrap: { minWidth: 34, height: 34, paddingHorizontal: 6, borderRadius: 17, alignItems: 'center', justifyContent: 'center', backgroundColor: '#111', borderWidth: 3, borderColor: '#fff', shadowColor: '#000', shadowOpacity: 0.25, shadowRadius: 6, shadowOffset: { width: 0, height: 2 } },
+  clusterText: { color: '#fff', fontSize: 13, fontWeight: '900' },
+
+  // quick radius chips
+  quickChipsWrap: { position: 'absolute', right: 10, top: SCREEN_H * 0.28, gap: 8, zIndex: 6, alignItems: 'flex-end' },
+  quickChip: { backgroundColor: '#0F172A', paddingHorizontal: 10, paddingVertical: 8, borderRadius: 12 },
+  quickChipActive: { backgroundColor: '#111' },
+  quickChipTxt: { color: '#fff', fontSize: 12, fontWeight: '800' },
+  quickChipTxtActive: { textDecorationLine: 'underline' },
 });
