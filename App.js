@@ -138,7 +138,7 @@ function AppInner() {
   const mapRef = useRef(null);
   const listRef = useRef(null);
   const pendingFocusCoordRef = useRef(null);
-  const pendingFocusScaleRef = useRef(1); // 1 = normální pin, 1.35 = vybraný pin
+  const pendingFocusScaleRef = useRef(0); // 0 = žádný offset (střed/moje poloha), 1.35 = vybraný pin
   // Guard to avoid setState loops while we animate the map
   const isAnimatingRef = useRef(false);
   const animTimerRef = useRef(null);
@@ -454,80 +454,66 @@ function AppInner() {
   const moveMarkerToVisibleCenter = async (coord, opts = {}) => {
     if (!mapRef.current || !region || !coord) return;
 
-    const { zoomFactor = 0.7, minDelta = 0.01, pinScale = 1, targetSpanM = null } = opts;
+    const { zoomFactor = 0.7, minDelta = 0.01, targetSpanM = null, pinScale = 0, duration = 320 } = opts;
 
-    // de-dupe: stejná cílová souřadnice + stejný stav listu + stejná scale krátce po sobě
+    // de-dupe
     const now = Date.now();
     const key = `${coord.latitude.toFixed(6)},${coord.longitude.toFixed(6)}|${isExpanded ? 1 : 0}|${pinScale}`;
     if (lastCenterRef.current?.key === key && now - lastCenterRef.current.ts < 600) return;
     lastCenterRef.current = { key, ts: now };
 
-    // throttle proti řetězení
+    // throttle
     if (centerLockRef.current) return;
     centerLockRef.current = true;
-    setTimeout(() => { centerLockRef.current = false; }, 450);
+    setTimeout(() => { centerLockRef.current = false; }, duration + 120);
 
     const topSafe = insets?.top || 0;
-    const topOcclusion = Math.max(topSafe, topUiBottomY); // započti překryv top UI
-    const sheetTopNow = sheetTop; // reálná pozice topu listu
+    const topOcclusion = Math.max(topSafe, topUiBottomY);
+    const sheetTopNow = sheetTop;
 
-    // Cíl: zobrazit PIN přesně uprostřed VIDITELNÉ mapy (mezi top UI a listem)
-    const EXTRA_CLEAR_PX = 0; // přesné centrování
+    // Střed VIDITELNÉ plochy (mezi horním UI a listem)
     const visibleH = Math.max(1, sheetTopNow - topOcclusion);
     const desiredCenterY = topOcclusion + visibleH / 2;
-    const desiredY = desiredCenterY + EXTRA_CLEAR_PX; // míříme na střed vizuální plochy
 
-    // počkej na vykreslení, ať coordinate/point převody sedí
+    // Pokud je pin (myčka) s anchor y=1, jeho špička je v místě geo souřadnice.
+    // Chceme, aby střed kruhu (hlava pinu) byl uprostřed viditelné části.
+    // Hlava je o PIN_ANCHOR_OFFSET_BASE*scale NAD špičkou (menší Y), takže
+    // špička (anchor) musí být o tuto hodnotu POD středem (větší Y).
+    const anchorOffsetPx = pinScale > 0 ? PIN_ANCHOR_OFFSET_BASE * pinScale : 0;
+    const desiredAnchorY = desiredCenterY + anchorOffsetPx; // <<< KLÍČOVÉ: plus, ne minus
+
+    // Počkej na frame, ať máme jistý layout
     await new Promise(r => requestAnimationFrame(r));
 
     const currentLatDelta = region.latitudeDelta || 0.02;
     const currentLonDelta = region.longitudeDelta || 0.02;
 
-    let nextLatDelta = Math.max(minDelta, currentLatDelta * zoomFactor);
-    let nextLonDelta = Math.max(minDelta, currentLonDelta * zoomFactor);
-
-    // Pokud je zadán cílový rozsah v metrech pro VIDITELNOU výšku mapy, spočti delty deterministicky
+    // Cílové delty (buď pevný viditelný span, nebo násobek zoomu)
+    let nextLatDelta, nextLonDelta;
     if (targetSpanM && targetSpanM > 0) {
-      const scaleFactor = SCREEN_H / visibleH; // MapView region se vztahuje na celé okno, ne jen viditelnou část
-      const latDeltaForVisible = (targetSpanM / METERS_PER_DEGREE_LAT) * scaleFactor;
-      nextLatDelta = Math.max(minDelta, latDeltaForVisible);
-      const aspect = SCREEN_W / SCREEN_H; // poměr pro celé okno MapView
+      const scaleFactor = SCREEN_H / visibleH; // region delty jsou vztaženy k celé výšce okna
+      nextLatDelta = Math.max(minDelta, (targetSpanM / METERS_PER_DEGREE_LAT) * scaleFactor);
+      const aspect = SCREEN_W / SCREEN_H;
       nextLonDelta = Math.max(minDelta, nextLatDelta * aspect);
+    } else {
+      nextLatDelta = Math.max(minDelta, currentLatDelta * zoomFactor);
+      nextLonDelta = Math.max(minDelta, currentLonDelta * zoomFactor);
     }
 
-    // Zjisti, jestli už jsme prakticky přesně ve středu (± tolerance)
-    let centered = false;
-    try {
-      const pt = await mapRef.current.pointForCoordinate(coord);
-      if (pt) {
-        const dx = Math.abs(pt.x - SCREEN_W / 2);
-        const dy = Math.abs(pt.y - desiredY);
-        centered = dx <= VIEW_TOLERANCE_PX && dy <= VIEW_TOLERANCE_PX;
-      }
-    } catch {}
-
-    const needZoom =
-      Math.abs(currentLatDelta - nextLatDelta) > 1e-6 ||
-      Math.abs(currentLonDelta - nextLonDelta) > 1e-6;
-
-    if (centered && !needZoom) return;
-
-    // Deterministicky spočítej cílový region na základě CÍLOVÉ delty, bez závislosti na aktuálním zoomu
-    const effectiveLatDelta = needZoom ? nextLatDelta : currentLatDelta;
-    const effectiveLonDelta = needZoom ? nextLonDelta : currentLonDelta;
-    const pixelDeltaY = desiredY - SCREEN_H / 2; // posun od středu obrazovky v pixelech
-    const degPerPxLat = effectiveLatDelta / SCREEN_H;
-    const targetLatitude = coord.latitude - pixelDeltaY * degPerPxLat;
-    const targetLongitude = coord.longitude; // horizontálně chceme střed, takže stačí střed = long cíle
+    // Jednofázový přepočet: zajistí, že geo-bod (špička pinu) skončí přesně v desiredAnchorY i při změně zoomu
+    const degPerPxLat = nextLatDelta / SCREEN_H;
+    const pixelDeltaY = desiredAnchorY - SCREEN_H / 2;
+    const targetLatitude = coord.latitude + pixelDeltaY * degPerPxLat;
 
     animateToRegionSafe({
       ...region,
       latitude: targetLatitude,
-      longitude: targetLongitude,
-      latitudeDelta: effectiveLatDelta,
-      longitudeDelta: effectiveLonDelta,
-    }, 300);
+      longitude: coord.longitude,
+      latitudeDelta: nextLatDelta,
+      longitudeDelta: nextLonDelta,
+    }, duration);
   };
+
 
   // BottomSheet
   const SNAP_COLLAPSED = 110;
@@ -543,26 +529,34 @@ function AppInner() {
   }, [isExpanded]);
 
   useEffect(() => {
-    const id = sheetH.addListener(({ value }) => setSheetTop(SCREEN_H - value));
+    const id = sheetH.addListener(({ value }) => {
+      // průběžně udržuj reálnou pozici horní hrany listu
+      setSheetTop(SCREEN_H - value);
+
+      // Jakmile animace listu dosedne na cílovou výšku, proveď centrování, pokud je naplánované
+      const targetH = isExpanded ? SNAP_EXPANDED : SNAP_COLLAPSED;
+      if (Math.abs(value - targetH) < 0.5 && pendingFocusCoordRef.current) {
+        const coord = pendingFocusCoordRef.current;
+        const scale = (pendingFocusScaleRef.current ?? 0);
+        // Počkej 1 frame, ať je layout jistě finální
+        requestAnimationFrame(() => {
+          moveMarkerToVisibleCenter(coord, {
+            zoomFactor: 0.7,
+            minDelta: 0.01,
+            pinScale: scale,
+            targetSpanM: TARGET_VISIBLE_SPAN_M,
+          });
+          pendingFocusCoordRef.current = null;
+          pendingFocusScaleRef.current = 0;
+        });
+      }
+    });
     return () => {
       sheetH.removeListener(id);
     };
-  }, [sheetH]);
+  }, [sheetH, isExpanded]);
 
-  // Když se list otevře a máme naplánované zarovnání (např. po vyhledání nebo tapu na pin),
-  // dorovnáme mapu tak, aby bod byl uprostřed viditelné mapy. Jinak nic neděláme (žádné auto-posouvání).
-  useEffect(() => {
-  if (!isExpanded) return;
-  const coord = pendingFocusCoordRef.current;
-  if (coord) {
-    pendingFocusCoordRef.current = null;
-    setTimeout(() => {
-      // po dojetí listu centrovat (počítej zvětšený pin)
-      moveMarkerToVisibleCenter(coord, { zoomFactor: 0.7, minDelta: 0.01, pinScale: pendingFocusScaleRef.current || 1, targetSpanM: TARGET_VISIBLE_SPAN_M });
-      pendingFocusScaleRef.current = 1;
-    }, 320);
-  }
-}, [isExpanded]);
+  // (centrování po otevření listu je nyní řešeno v efektu sheetH.addListener)
 
   const km = (radiusM / 1000).toFixed(1);
 
@@ -656,7 +650,7 @@ function AppInner() {
         : { latitude: searchCenter.latitude, longitude: searchCenter.longitude };
 
       pendingFocusCoordRef.current = focusCoord;
-      pendingFocusScaleRef.current = 1;
+      pendingFocusScaleRef.current = 0; // centrování na střed/moji polohu → bez offsetu pinu
 
       setIsExpanded(true);
     } catch (e) {
@@ -779,7 +773,7 @@ function AppInner() {
       disableFollow();
       if (isExpanded) {
         // list is open → center into the visible area (avoid notch and sheet)
-        moveMarkerToVisibleCenter({ latitude, longitude }, { zoomFactor: 0.65, minDelta: 0.01 });
+        moveMarkerToVisibleCenter({ latitude, longitude }, { zoomFactor: 0.65, minDelta: 0.01, pinScale: 0 });
       } else {
         // list is closed → do a manual zoom-in around cluster center
         const latDelta = Math.max(0.006, (region?.latitudeDelta || 0.04) * 0.6);
@@ -870,7 +864,7 @@ function AppInner() {
                 tracksViewChanges={false}
                 zIndex={selectedId === p.id ? 999 : 1}
                 cluster={selectedId === p.id ? false : true}
-                anchor={{ x: 0.5, y: 0.5 }}
+                anchor={{ x: 0.5, y: 1 }}
               >
                 <Animated.View style={[styles.pinWrap, { transform: [{ scale }] }]}>
                   {selectedId === p.id && <View style={[styles.pinGlow, { borderColor: color }]} />}
