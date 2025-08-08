@@ -542,6 +542,13 @@ function AppInner() {
     Animated.spring(sheetH, { toValue: isExpanded ? SNAP_EXPANDED : SNAP_COLLAPSED, useNativeDriver: false, friction: 9, tension: 80 }).start();
   }, [isExpanded]);
 
+  useEffect(() => {
+    const id = sheetH.addListener(({ value }) => setSheetTop(SCREEN_H - value));
+    return () => {
+      sheetH.removeListener(id);
+    };
+  }, [sheetH]);
+
   // Když se list otevře a máme naplánované zarovnání (např. po vyhledání nebo tapu na pin),
   // dorovnáme mapu tak, aby bod byl uprostřed viditelné mapy. Jinak nic neděláme (žádné auto-posouvání).
   useEffect(() => {
@@ -976,7 +983,6 @@ function AppInner() {
 
       {/* BottomSheet */}
       <Animated.View
-        onLayout={(e) => setSheetTop(e.nativeEvent.layout.y)}
         style={[styles.sheet, { height: sheetH, backgroundColor: P.bg, borderTopColor: P.border, borderTopWidth: isDark ? 1 : 0 }]}
       >
         {/* Měříme výšku handle + hlavičky + filtrů, aby scrollToIndex nepřekryl položku */}
