@@ -53,3 +53,4 @@ EXPO_PUBLIC_GOOGLE_MAPS_API_KEY=TVUJ_KLIC
 - Cache + offline poslední výsledky
 - Clustering pinů + next_page_token (víc výsledků v okolí)
 
+
