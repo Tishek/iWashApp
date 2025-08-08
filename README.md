@@ -42,7 +42,7 @@ EXPO_PUBLIC_GOOGLE_MAPS_API_KEY=TVUJ_KLIC
 - Nastavení → Preferovaná navigace (Apple / Google / Waze / Zeptat se).
 - Pokud je zvolená jedna appka, v kartě je jedno velké „Navigovat“ + „…“ pro rychlou změnu.
 
-##🌓 Vzhled
+## 🌓 Vzhled
 - app.json má "userInterfaceStyle": "automatic" (respektuje systém).
 - V appce lze přepnout Systém / Světlý / Tmavý.
 
