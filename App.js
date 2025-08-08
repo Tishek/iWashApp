@@ -75,8 +75,7 @@ function distanceMeters(a, b) {
   const la1 = toRad(a.latitude);
   const la2 = toRad(b.latitude);
   const h = Math.sin(dLat/2)**2 + Math.cos(la1)*Math.cos(la2)*Math.sin(dLon/2)**2;
-  // floating point errors can push h slightly above 1, which breaks asin
-  return 2 * R * Math.asin(Math.min(1, Math.sqrt(h)));
+  return 2 * R * Math.asin(Math.sqrt(h));
 }
 
 // normalizace textu (bez diakritiky)
