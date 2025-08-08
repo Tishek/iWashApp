@@ -17,7 +17,6 @@
     },
     "scheme": "iwash",
     "userInterfaceStyle": "automatic",
-    
     "ios": {
       "supportsTablet": false,
       "bundleIdentifier": "cz.iwash.app",
@@ -34,6 +33,19 @@
     "web": {
       "bundler": "metro",
       "output": "single"
+    },
+    "extra": {
+      "eas": {
+        "projectId": "dd1263a5-5c5e-4474-9632-787e599d033e"
+      }
+    },
+    "owner": "tishek",
+    "privacy": "unlisted",
+    "runtimeVersion": {
+      "policy": "appVersion"
+    },
+    "updates": {
+      "url": "https://u.expo.dev/dd1263a5-5c5e-4474-9632-787e599d033e"
     }
   }
 }

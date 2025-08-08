@@ -32,6 +32,7 @@ const ITEM_H = 112; // odhad výšky karty + separator
 const MIN_M = 1000;  // 1 km
 const MAX_M = 5000;  // 5 km
 const STEP_M = 100;
+const MAX_RESULTS = 60;
 
 const API_KEY = process.env.EXPO_PUBLIC_GOOGLE_MAPS_API_KEY;
 
@@ -44,6 +45,7 @@ const DEFAULT_SETTINGS = {
   preferredNav: 'ask', // 'ask' | 'apple' | 'google' | 'waze'
 };
 const SETTINGS_KEY = 'iwash_settings_v1';
+const FAVORITES_KEY = 'iwash_favorites_v1';
 
 // haversine v metrech
 function distanceMeters(a, b) {
@@ -137,13 +139,16 @@ export default function App() {
   const [lastError, setLastError] = useState(null);
   const [selectedId, setSelectedId] = useState(null);
 
+  // favorites (persistováno v AsyncStorage)
+  const [favorites, setFavorites] = useState({}); // { [place_id]: true }
+
   // auto reload (zrcadlí settings.autoReload)
   const [autoReload, setAutoReload] = useState(DEFAULT_SETTINGS.autoReload);
   const autoDebounce = useRef(null);
   const mountedRef = useRef(false);
 
   // filtry
-  const [filterMode, setFilterMode] = useState('ALL'); // ALL | CONTACT | NONCONTACT | FULLSERVICE
+  const [filterMode, setFilterMode] = useState('ALL'); // ALL | CONTACT | NONCONTACT | FULLSERVICE | FAV
 
   // --- Animace zvětšení vybraného pinu ---
   const pinScales = useRef({});
@@ -200,10 +205,30 @@ export default function App() {
     })();
   }, []);
 
+  // --- Favorites load ---
+  useEffect(() => {
+    (async () => {
+      try {
+        const raw = await AsyncStorage.getItem(FAVORITES_KEY);
+        if (raw) setFavorites(JSON.parse(raw));
+      } catch {}
+    })();
+  }, []);
+
   const saveSettings = async (patch) => {
     setSettings(prev => {
       const next = { ...prev, ...patch };
       AsyncStorage.setItem(SETTINGS_KEY, JSON.stringify(next)).catch(() => {});
+      return next;
+    });
+  };
+
+  const isFav = (id) => !!favorites[id];
+  const toggleFav = (item) => {
+    setFavorites(prev => {
+      const next = { ...prev };
+      if (next[item.id]) delete next[item.id]; else next[item.id] = true;
+      AsyncStorage.setItem(FAVORITES_KEY, JSON.stringify(next)).catch(() => {});
       return next;
     });
   };
@@ -369,20 +394,12 @@ export default function App() {
       setLastError(null);
       setSelectedId(null);
 
-      const url =
-        `https://maps.googleapis.com/maps/api/place/nearbysearch/json` +
-        `?location=${searchCenter.latitude},${searchCenter.longitude}` +
-        `&radius=${radiusM}` +
-        `&type=car_wash&key=${API_KEY}`;
+            const base = `https://maps.googleapis.com/maps/api/place/nearbysearch/json`;
+      const acc = [];
+      let pageToken = null;
+      let safety = 0;
 
-      const res = await fetch(url);
-      const json = await res.json();
-
-      if (json.status !== 'OK' && json.status !== 'ZERO_RESULTS') {
-        throw new Error(json.error_message || json.status || 'Neznámá chyba Places API');
-      }
-
-      const raw = (json.results || []).map(p => {
+      const mapPlace = (p) => {
         const loc = { latitude: p.geometry?.location?.lat ?? 0, longitude: p.geometry?.location?.lng ?? 0 };
         const address = p.vicinity || p.formatted_address || '';
         const inferredBase = inferType(p.name, p.types, address);
@@ -390,10 +407,9 @@ export default function App() {
         const n = normalizeStr(p.name).toLowerCase();
         const a = normalizeStr(address).toLowerCase();
 
-        // vyloučení vybraných entit (např. Auto Podbabská – autoservis)
+        // vyřadit „Auto Podbabská“ apod.
         if (OVERRIDE_EXCLUDE.some(k => n.includes(k) || a.includes(k))) return null;
 
-        // silné přiřazení typu
         const inferred = OVERRIDE_FULL.some(k => n.includes(k) || a.includes(k)) ? 'FULLSERVICE' : inferredBase;
 
         return {
@@ -408,14 +424,47 @@ export default function App() {
           inferredType: inferred,
           openNow: (p.opening_hours && typeof p.opening_hours.open_now === 'boolean') ? p.opening_hours.open_now : null,
         };
-      });
+      };
 
-      const items = raw.filter(Boolean).sort((a, b) => a.distanceM - b.distanceM);
+      do {
+        const url = pageToken
+          ? `${base}?pagetoken=${pageToken}&key=${API_KEY}`
+          : `${base}?location=${searchCenter.latitude},${searchCenter.longitude}&radius=${radiusM}&type=car_wash&key=${API_KEY}`;
+
+        const res = await fetch(url);
+        const json = await res.json();
+
+        if (json.status !== 'OK' && json.status !== 'ZERO_RESULTS') {
+          throw new Error(json.error_message || json.status || 'Neznámá chyba Places API');
+        }
+
+        const pageItems = (json.results || []).map(mapPlace).filter(Boolean);
+
+        // merge bez duplikátů (dle place_id)
+        for (const it of pageItems) {
+          if (!acc.some(x => x.id === it.id)) acc.push(it);
+        }
+
+        pageToken = json.next_page_token && acc.length < MAX_RESULTS ? json.next_page_token : null;
+
+        if (pageToken) {
+          // token je platný až po ~2 s
+          await new Promise(r => setTimeout(r, 2000));
+        }
+        safety++;
+      } while (pageToken && acc.length < MAX_RESULTS && safety < 5);
+
+      const items = acc.sort((a, b) => a.distanceM - b.distanceM);
       setPlaces(items);
 
       if (mapRef.current && items.length > 0) {
         mapRef.current.animateToRegion(
-          { latitude: searchCenter.latitude, longitude: searchCenter.longitude, latitudeDelta: Math.max(0.01, region?.latitudeDelta ?? 0.02), longitudeDelta: Math.max(0.01, region?.longitudeDelta ?? 0.02) },
+          {
+            latitude: searchCenter.latitude,
+            longitude: searchCenter.longitude,
+            latitudeDelta: Math.max(0.01, region?.latitudeDelta ?? 0.02),
+            longitudeDelta: Math.max(0.01, region?.longitudeDelta ?? 0.02)
+          },
           400
         );
       }
@@ -446,8 +495,9 @@ export default function App() {
 
   const filteredPlaces = useMemo(() => {
     if (filterMode === 'ALL') return places;
+    if (filterMode === 'FAV') return places.filter(p => isFav(p.id));
     return places.filter(p => p.inferredType === filterMode);
-  }, [places, filterMode]);
+  }, [places, filterMode, favorites]);
 
   const idToIndex = useMemo(() => {
     const m = {};
@@ -497,7 +547,7 @@ export default function App() {
     else if (app === 'waze') url = `https://waze.com/ul?ll=${latitude},${longitude}&navigate=yes`;
     Linking.openURL(url).catch(() => Alert.alert('Nelze otevřít', 'Zkuste jinou navigaci.'));
   };
-    const onNavigatePreferred = (p) => {
+  const onNavigatePreferred = (p) => {
     const pref = settings.preferredNav || 'ask';
     if (pref === 'ask') {
       Alert.alert('Navigovat', 'Vyber aplikaci', [
@@ -554,6 +604,11 @@ export default function App() {
                   {selectedId === p.id && <View style={[styles.pinGlow, { borderColor: color }]} />}
                   <View style={[styles.pinTop, { backgroundColor: color }]} />
                   <View style={[styles.pinStem, { backgroundColor: color }]} />
+                  {isFav(p.id) && (
+                    <View style={styles.pinFav}>
+                      <Text style={styles.pinFavTxt}>★</Text>
+                    </View>
+                  )}
                 </Animated.View>
               </Marker>
             );
@@ -602,8 +657,6 @@ export default function App() {
           <Text style={{ fontSize: 16, fontWeight: '900', color: P.text }}>⚙︎</Text>
         </TouchableOpacity>
       </BlurView>
-
-      {/* FABs – schovat, když je list otevřený */}
 
       {/* Dock s rychlým nastavením radiusu + hledání + centrování */}
       {!isExpanded && (
@@ -656,24 +709,33 @@ export default function App() {
           </View>
 
           {/* Filtry */}
-          <View style={styles.filterRow}>
-            {[
-              { key: 'ALL', label: 'Vše' },
-              { key: 'CONTACT', label: 'Kontaktní' },
-              { key: 'NONCONTACT', label: 'Bezkontaktní' },
-              { key: 'FULLSERVICE', label: 'Full service' }
-            ].map(btn => (
-              <TouchableOpacity
-                key={btn.key}
-                onPress={() => { Haptics.selectionAsync(); setFilterMode(btn.key); }}
-                style={[styles.filterBtn, { backgroundColor: (filterMode === btn.key) ? '#111' : (isDark ? '#0F1522' : '#F2F4F7'), borderColor: P.border, borderWidth: isDark ? 1 : 0 }]}
-              >
-                <Text style={[styles.filterTxt, { color: (filterMode === btn.key) ? '#fff' : P.text }]}>
-                  {btn.label}
-                </Text>
-              </TouchableOpacity>
-            ))}
-          </View>
+          <ScrollView
+          horizontal
+          showsHorizontalScrollIndicator={false}
+          contentContainerStyle={styles.filterRow}
+        >
+          {[
+            { key: 'ALL', label: 'Vše' },
+            { key: 'CONTACT', label: 'Kontaktní' },
+            { key: 'NONCONTACT', label: 'Bezkontaktní' },
+            { key: 'FULLSERVICE', label: 'Full service' },
+            { key: 'FAV', label: 'Oblíbené' },
+          ].map(btn => (
+            <TouchableOpacity
+              key={btn.key}
+              onPress={() => { Haptics.selectionAsync(); setFilterMode(btn.key); }}
+              style={[
+                styles.filterBtn,
+                { backgroundColor: (filterMode === btn.key) ? '#111' : (isDark ? '#0F1522' : '#F2F4F7'),
+                  borderColor: P.border, borderWidth: isDark ? 1 : 0 }
+              ]}
+            >
+              <Text style={[styles.filterTxt, { color: (filterMode === btn.key) ? '#fff' : P.text }]}>
+                {btn.label}
+              </Text>
+            </TouchableOpacity>
+          ))}
+        </ScrollView>
         </View>
 
         <View style={styles.sheetBody}>
@@ -703,8 +765,16 @@ export default function App() {
                   onPress={() => { Haptics.selectionAsync(); focusPlace(item); }}
                 >
                   <View style={{ flex: 1 }}>
-                    <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8 }}>
-                      <Text style={[styles.cardTitle, { color: P.text }]} numberOfLines={1}>{item.name}</Text>
+                    <View style={{ flexDirection: 'row', alignItems: 'center' }}>
+                      <View style={{ flex: 1, paddingRight: 8 }}>
+                        <Text style={[styles.cardTitle, { color: P.text }]} numberOfLines={1}>{item.name}</Text>
+                      </View>
+                      <TouchableOpacity onPress={() => toggleFav(item)} style={styles.favBtn} hitSlop={{ top: 8, left: 8, right: 8, bottom: 8 }}>
+                        <Text style={[styles.favIcon, isFav(item.id) && styles.favIconActive]}>★</Text>
+                      </TouchableOpacity>
+                    </View>
+
+                    <View style={styles.badgeRow}>
                       <View style={[
                         styles.badge,
                         item.inferredType === 'NONCONTACT' ? { backgroundColor: '#E8F2FF' } :
@@ -723,48 +793,51 @@ export default function App() {
                         </Text>
                       </View>
                     </View>
+
                     <Text style={[styles.cardSub, { color: P.textMute }]} numberOfLines={1}>{item.address}</Text>
+
                     <View style={styles.metaRow}>
-                    <Text style={[styles.cardMeta, { color: P.textMute }]}>
-                      {(item.distanceM >= 1000 ? (item.distanceM / 1000).toFixed(1) + ' km' : item.distanceM + ' m')}
-                      {item.rating ? ` • ★ ${item.rating} (${item.userRatingsTotal || 0})` : ''}
-                    </Text>
-                    {item.openNow !== null && (
-                      <View style={styles.openBadge}>
-                        <View style={[styles.openDot, { backgroundColor: item.openNow ? '#12B76A' : '#94A3B8' }]} />
-                        <Text style={[styles.openTxt, { color: P.textMute }]}>{item.openNow ? 'Otevřeno' : 'Zavřeno'}</Text>
-                      </View>
+                      <Text style={[styles.cardMeta, { color: P.textMute }]}>
+                        {(item.distanceM >= 1000 ? (item.distanceM / 1000).toFixed(1) + ' km' : item.distanceM + ' m')}
+                        {item.rating ? ` • ★ ${item.rating} (${item.userRatingsTotal || 0})` : ''}
+                      </Text>
+                      {item.openNow !== null && (
+                        <View style={styles.openBadge}>
+                          <View style={[styles.openDot, { backgroundColor: item.openNow ? '#12B76A' : '#94A3B8' }]} />
+                          <Text style={[styles.openTxt, { color: P.textMute }]}>{item.openNow ? 'Otevřeno' : 'Zavřeno'}</Text>
+                        </View>
+                      )}
+                    </View>
+                  </View>
+
+                  <View style={styles.navRow}>
+                    {settings.preferredNav && settings.preferredNav !== 'ask' ? (
+                      <>
+                        <TouchableOpacity onPress={() => onNavigatePreferred(item)} style={styles.navBigBtn}>
+                          <Text style={styles.navBigTxt}>Navigovat</Text>
+                        </TouchableOpacity>
+                        <TouchableOpacity
+                          onPress={() => {
+                            Alert.alert('Navigovat jinam', 'Vyber aplikaci', [
+                              { text: 'Apple',  onPress: () => openNavigation(item, 'apple') },
+                              { text: 'Google', onPress: () => openNavigation(item, 'google') },
+                              { text: 'Waze',   onPress: () => openNavigation(item, 'waze') },
+                              { text: 'Zrušit', style: 'cancel' },
+                            ]);
+                          }}
+                          style={styles.navMoreBtn}
+                        >
+                          <Text style={styles.navMoreTxt}>⋯</Text>
+                        </TouchableOpacity>
+                      </>
+                    ) : (
+                      <>
+                        <TouchableOpacity onPress={() => openNavigation(item, 'apple')}  style={styles.navBtn}><Text style={styles.navTxt}>Apple</Text></TouchableOpacity>
+                        <TouchableOpacity onPress={() => openNavigation(item, 'google')} style={styles.navBtn}><Text style={styles.navTxt}>Google</Text></TouchableOpacity>
+                        <TouchableOpacity onPress={() => openNavigation(item, 'waze')}   style={styles.navBtn}><Text style={styles.navTxt}>Waze</Text></TouchableOpacity>
+                      </>
                     )}
                   </View>
-                  </View>
-                  <View style={styles.navRow}>
-                  {settings.preferredNav && settings.preferredNav !== 'ask' ? (
-                    <>
-                      <TouchableOpacity onPress={() => onNavigatePreferred(item)} style={styles.navBigBtn}>
-                        <Text style={styles.navBigTxt}>Navigovat</Text>
-                      </TouchableOpacity>
-                      <TouchableOpacity
-                        onPress={() => {
-                          Alert.alert('Navigovat jinam', 'Vyber aplikaci', [
-                            { text: 'Apple',  onPress: () => openNavigation(item, 'apple') },
-                            { text: 'Google', onPress: () => openNavigation(item, 'google') },
-                            { text: 'Waze',   onPress: () => openNavigation(item, 'waze') },
-                            { text: 'Zrušit', style: 'cancel' },
-                          ]);
-                        }}
-                        style={styles.navMoreBtn}
-                      >
-                        <Text style={styles.navMoreTxt}>⋯</Text>
-                      </TouchableOpacity>
-                    </>
-                  ) : (
-                    <>
-                      <TouchableOpacity onPress={() => openNavigation(item, 'apple')}  style={styles.navBtn}><Text style={styles.navTxt}>Apple</Text></TouchableOpacity>
-                      <TouchableOpacity onPress={() => openNavigation(item, 'google')} style={styles.navBtn}><Text style={styles.navTxt}>Google</Text></TouchableOpacity>
-                      <TouchableOpacity onPress={() => openNavigation(item, 'waze')}   style={styles.navBtn}><Text style={styles.navTxt}>Waze</Text></TouchableOpacity>
-                    </>
-                  )}
-                </View>
                 </TouchableOpacity>
               )}
             />
@@ -810,6 +883,7 @@ export default function App() {
                 ))}
               </View>
             </View>
+
             {/* Preferovaná navigace */}
             <View style={styles.setGroup}>
               <Text style={[styles.setGroupTitle, { color: P.text }]}>Preferovaná navigace</Text>
@@ -830,6 +904,7 @@ export default function App() {
                 ))}
               </View>
             </View>      
+
             {/* Výchozí radius */}
             <View style={styles.setGroup}> 
               <Text style={[styles.setGroupTitle, { color: P.text }]}>Výchozí radius</Text>
@@ -1054,6 +1129,14 @@ const styles = StyleSheet.create({
   navMoreTxt: { color: '#fff', fontSize: 16, fontWeight: '900' },
   badge: { paddingHorizontal: 8, paddingVertical: 4, borderRadius: 999 },
   badgeTxt: { fontSize: 11, fontWeight: '800' },
+  badgeRow: { flexDirection: 'row', marginTop: 4 },
+
+  // favorites styles
+  favIcon: { fontSize: 18, fontWeight: '900', color: '#CBD5E1' },
+  favIconActive: { color: '#F59E0B' },
+  pinFav: { position: 'absolute', top: -10, left: -8 },
+  pinFavTxt: { fontSize: 12, fontWeight: '900', color: '#F59E0B' },
+  favBtn: { marginLeft: 8, width: 24, alignItems: 'center' },
 
   // settings
   settingsWrap: { flex: 1 },
