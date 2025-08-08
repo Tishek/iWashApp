@@ -467,13 +467,14 @@ function AppInner() {
     centerLockRef.current = true;
     setTimeout(() => { centerLockRef.current = false; }, 450);
 
-    const sheetHNow = isExpanded ? SNAP_EXPANDED : SNAP_COLLAPSED;
     const topSafe = insets?.top || 0;
     const topOcclusion = Math.max(topSafe, topUiBottomY); // započti překryv top UI
+    const sheetTopNow = sheetTop; // reálná pozice topu listu
 
     // Cíl: zobrazit PIN přesně uprostřed VIDITELNÉ mapy (mezi top UI a listem)
     const EXTRA_CLEAR_PX = 0; // přesné centrování
-    const desiredCenterY = topOcclusion + (SCREEN_H - topOcclusion - sheetHNow) / 2;
+    const visibleH = Math.max(1, sheetTopNow - topOcclusion);
+    const desiredCenterY = topOcclusion + visibleH / 2;
     const desiredY = desiredCenterY + EXTRA_CLEAR_PX; // míříme na střed vizuální plochy
 
     // počkej na vykreslení, ať coordinate/point převody sedí
@@ -487,7 +488,6 @@ function AppInner() {
 
     // Pokud je zadán cílový rozsah v metrech pro VIDITELNOU výšku mapy, spočti delty deterministicky
     if (targetSpanM && targetSpanM > 0) {
-      const visibleH = Math.max(1, SCREEN_H - Math.max(insets?.top || 0, topUiBottomY) - sheetHNow); // px
       const scaleFactor = SCREEN_H / visibleH; // MapView region se vztahuje na celé okno, ne jen viditelnou část
       const latDeltaForVisible = (targetSpanM / METERS_PER_DEGREE_LAT) * scaleFactor;
       nextLatDelta = Math.max(minDelta, latDeltaForVisible);
@@ -534,6 +534,7 @@ function AppInner() {
   const SNAP_EXPANDED = Math.min(420, SCREEN_H * 0.6);
   const [isExpanded, setIsExpanded] = useState(false);
   const [sheetTopH, setSheetTopH] = useState(0); // 🔸 výška handle+header+filtry
+  const [sheetTop, setSheetTop] = useState(SCREEN_H - SNAP_COLLAPSED); // reálný top listu
 
   // Animate HEIGHT instead of translateY to avoid scroll glitches on iOS
   const sheetH = useRef(new Animated.Value(SNAP_COLLAPSED)).current;
@@ -975,6 +976,7 @@ function AppInner() {
 
       {/* BottomSheet */}
       <Animated.View
+        onLayout={(e) => setSheetTop(e.nativeEvent.layout.y)}
         style={[styles.sheet, { height: sheetH, backgroundColor: P.bg, borderTopColor: P.border, borderTopWidth: isDark ? 1 : 0 }]}
       >
         {/* Měříme výšku handle + hlavičky + filtrů, aby scrollToIndex nepřekryl položku */}
