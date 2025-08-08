@@ -39,16 +39,17 @@ EXPO_PUBLIC_GOOGLE_MAPS_API_KEY=TVUJ_KLIC
 `npx expo start -c`
 
 ## 🧭 Navigace
-    •    Nastavení → Preferovaná navigace (Apple / Google / Waze / Zeptat se).
-    •    Pokud je zvolená jedna appka, v kartě je jedno velké „Navigovat“ + „…“ pro rychlou změnu.
+- Nastavení → Preferovaná navigace (Apple / Google / Waze / Zeptat se).
+- Pokud je zvolená jedna appka, v kartě je jedno velké „Navigovat“ + „…“ pro rychlou změnu.
 
 ## 🌓 Vzhled
-    •    app.json má "userInterfaceStyle": "automatic" (respektuje systém).
-    •    V appce lze přepnout Systém / Světlý / Tmavý.
+- app.json má "userInterfaceStyle": "automatic" (respektuje systém).
+- V appce lze přepnout Systém / Světlý / Tmavý.
 
 ## 🛣 Roadmap
-    •    ⭐️ Oblíbené (AsyncStorage)
-    •    Další filtry (nonstop, samoobsluha…)
-    •    Recenze & detail hodnocení
-    •    Cache + offline poslední výsledky
-    •    Clustering pinů + next_page_token (víc výsledků v okolí)
+- ⭐️ Oblíbené (AsyncStorage)
+- Další filtry (nonstop, samoobsluha…)
+- Recenze & detail hodnocení
+- Cache + offline poslední výsledky
+- Clustering pinů + next_page_token (víc výsledků v okolí)
+
