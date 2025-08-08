@@ -1,25 +1,11 @@
 import { StatusBar } from 'expo-status-bar';
 import React, { useEffect, useRef, useState, useMemo } from 'react';
 import {
-  StyleSheet,
-  View,
-  Text,
-  TouchableOpacity,
-  Animated,
-  TextInput,
-  Dimensions,
-  Keyboard,
-  Linking,
-  FlatList,
-  Alert,
-  Switch,
-  ActivityIndicator,
-  Modal,
-  ScrollView,
-  useColorScheme,
-  Image,
+  StyleSheet, View, Text, TouchableOpacity, Animated,
+  Dimensions, FlatList, Alert, Linking, Switch, ActivityIndicator,
+  Modal, ScrollView, useColorScheme, Image,
 } from 'react-native';
-import MapView, { Marker, PROVIDER_DEFAULT, Circle } from 'react-native-maps';
+import { Marker, PROVIDER_DEFAULT, Circle } from 'react-native-maps';
 import ClusteredMapView from 'react-native-map-clustering';
 import * as Location from 'expo-location';
 import Slider from '@react-native-community/slider';
@@ -35,11 +21,9 @@ const MIN_M = 500;   // 0.5 km
 const MAX_M = 5000;  // 5 km
 const STEP_M = 100;
 const MAX_RESULTS = 60;
-const PIN_ANCHOR_Y = 18; // px – souřadnice markeru je ve špičce, tím dorovnáme kolečko do středu
 const PIN_SELECTED_SCALE = 1.35; // scale vybraného pinu – používej všude stejnou hodnotu
 // Výška pin view v základním měřítku (px). Použije se pro kompenzaci posunu při scale animaci,
 // aby špička pinu (anchor) zůstala na stejném místě.
-const PIN_BASE_H = 28;
 
 // Geometrie pinu (musí odpovídat stylům níže)
 const PIN_TOP_H = 18;         // styles.pinTop.height
@@ -156,8 +140,6 @@ function AppInner() {
   const centerLockRef = useRef(false);
   // de-dupe opakovaných centerů na stejný cíl
   const lastCenterRef = useRef({ key: '', ts: 0 });
-  // počkej na vykreslení (řeší coordinateForPoint hned po animaci)
-  const afterPaint = () => new Promise(r => requestAnimationFrame(r));
 
   const systemScheme = useColorScheme();
 
@@ -183,15 +165,12 @@ function AppInner() {
 
   // radius (m)
   const [radiusM, setRadiusM] = useState(DEFAULT_SETTINGS.defaultRadiusM);
-  const [radiusText, setRadiusText] = useState(String(DEFAULT_SETTINGS.defaultRadiusM));
 
   // data myček
   const [places, setPlaces] = useState([]);
   const [loading, setLoading] = useState(false);
   const [lastError, setLastError] = useState(null);
   const [selectedId, setSelectedId] = useState(null);
-  // Dynamicky změřená výška pinu (kvůli přesné kompenzaci scale)
-  const [pinBaseHState, setPinBaseHState] = useState(PIN_BASE_H);
 
   // favorites (persistováno v AsyncStorage)
   const [favorites, setFavorites] = useState({}); // { [place_id]: true }
@@ -273,7 +252,6 @@ function AppInner() {
           setSettings(parsed);
           setAutoReload(!!parsed.autoReload);
           setRadiusM(parsed.defaultRadiusM);
-          setRadiusText(String(parsed.defaultRadiusM));
         }
       } catch {}
     })();
@@ -418,7 +396,6 @@ function AppInner() {
   const commitRadius = (valM) => {
     const v = clamp(Math.round(valM / STEP_M) * STEP_M, MIN_M, MAX_M);
     setRadiusM(v);
-    setRadiusText(String(v));
   };
 
   // cluster radius v pixelech – čím víc přiblíženo, tím menší radius
@@ -429,27 +406,14 @@ function AppInner() {
     const r = Math.round(80 - zoom * 4);
     return clamp(r, 18, 72);
   }, [region]);
-  const dec = () => commitRadius(radiusM - STEP_M);
-  const inc = () => commitRadius(radiusM + STEP_M);
-  const onTextChange = (t) => setRadiusText(t.replace(/[^\d]/g, ''));
-  const onTextEnd = () => {
-    const parsed = parseInt(radiusText, 10);
-    if (!isNaN(parsed)) commitRadius(parsed);
-    else setRadiusText(String(radiusM));
-    Keyboard.dismiss();
-  };
 
   // Helper to adjust radius by delta and persist
   const adjustRadius = (delta) => {
-    Haptics.selectionAsync();
-    const next = clamp(Math.round((radiusM + delta) / STEP_M) * STEP_M, MIN_M, MAX_M);
-    setRadiusM(next);
-    setRadiusText(String(next));
-    saveSettings({ defaultRadiusM: next });
+  Haptics.selectionAsync();
+  const next = clamp(Math.round((radiusM + delta) / STEP_M) * STEP_M, MIN_M, MAX_M);
+  setRadiusM(next);
+  saveSettings({ defaultRadiusM: next });
   };
-
-  // Pomocník: posuň mapu tak, aby byl pin uprostřed VIDITELNÉ mapy (mezi notchem a listem)
-  const VIEW_TOLERANCE_PX = 12; // když je pin v ±12 px od cíle, už neanimujeme
 
   const moveMarkerToVisibleCenter = async (coord, opts = {}) => {
     if (!mapRef.current || !region || !coord) return;
@@ -555,10 +519,6 @@ function AppInner() {
       sheetH.removeListener(id);
     };
   }, [sheetH, isExpanded]);
-
-  // (centrování po otevření listu je nyní řešeno v efektu sheetH.addListener)
-
-  const km = (radiusM / 1000).toFixed(1);
 
   // Střed vyhledávání podle nastavení
   const searchCenter = useMemo(() => {
@@ -698,7 +658,41 @@ function AppInner() {
     return m;
   }, [filteredPlaces]);
 
-  const selectedPlace = useMemo(() => filteredPlaces.find(p => p.id === selectedId) || null, [selectedId, filteredPlaces]);
+  const openNavigation = async (item, app) => {
+    const loc = item?.location;
+    if (!loc || typeof loc.latitude !== 'number' || typeof loc.longitude !== 'number') {
+      Alert.alert('Chyba', 'Cíl nemá platnou polohu.');
+      return;
+    }
+    const { latitude, longitude } = loc;
+    const label = encodeURIComponent(item?.name || 'Cíl');
+
+    let url = '';
+    switch (app) {
+      case 'apple':
+        url = `http://maps.apple.com/?ll=${latitude},${longitude}&q=${label}`;
+        break;
+      case 'google':
+        url = `https://www.google.com/maps/dir/?api=1&destination=${latitude},${longitude}&travelmode=driving`;
+        break;
+      case 'waze':
+        url = `https://waze.com/ul?ll=${latitude},${longitude}&navigate=yes`;
+        break;
+      default:
+        url = `https://www.google.com/maps/search/?api=1&query=${latitude},${longitude}`;
+    }
+
+    try {
+      await Linking.openURL(url);
+    } catch (e) {
+      Alert.alert('Nejde otevřít navigaci', 'Zkus jinou aplikaci.');
+    }
+  };
+
+  const onNavigatePreferred = (item) => {
+    const app = settings.preferredNav || 'google';
+    openNavigation(item, app);
+  };
 
   const focusPlace = async (p) => {
     Haptics.selectionAsync();
@@ -793,21 +787,6 @@ function AppInner() {
 
   return (
     <View style={[styles.container, { backgroundColor: P.bg }]}>
-      {/* Offscreen měření skutečné výšky pinu pro přesnou kompenzaci */}
-      <View
-        style={{ position: 'absolute', opacity: 0, left: -9999, top: -9999 }}
-        onLayout={(e) => {
-          const h = e?.nativeEvent?.layout?.height;
-          if (h && Math.abs(h - pinBaseHState) > 0.5) {
-            setPinBaseHState(h);
-          }
-        }}
-      >
-        <View style={styles.pinWrap}>
-          <View style={[styles.pinTop, { backgroundColor: '#000' }]} />
-          <View style={[styles.pinStem, { backgroundColor: '#000' }]} />
-        </View>
-      </View>
       {region && (
         <ClusteredMapView
           ref={mapRef}
@@ -1292,47 +1271,6 @@ const styles = StyleSheet.create({
   modeBtn: { paddingHorizontal: 10, paddingVertical: 6, borderRadius: 10, borderWidth: StyleSheet.hairlineWidth },
   modeBtnTxt: { fontSize: 13, fontWeight: '800' },
 
-  radiusCard: {
-    position: 'absolute',
-    left: 12, top: 110, right: 12,
-    borderRadius: 16,
-    padding: 12, gap: 8,
-    shadowColor: '#000', shadowOpacity: 0.12, shadowRadius: 10, shadowOffset: { width: 0, height: 6 },
-    elevation: 5,
-  },
-  radiusLabel: { fontSize: 13, fontWeight: '700', opacity: 0.9 },
-  radiusRow: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', gap: 8 },
-
-  stepBtn: { paddingHorizontal: 12, paddingVertical: 10, borderRadius: 12, backgroundColor: '#111' },
-  stepBtnTxt: { color: '#fff', fontWeight: '700' },
-
-  inputWrap: {
-    flexDirection: 'row', alignItems: 'center',
-    borderRadius: 12,
-    paddingHorizontal: 12, paddingVertical: 6, minWidth: 140, justifyContent: 'center'
-  },
-  input: { fontSize: 16, fontWeight: '700', paddingVertical: 6, minWidth: 72 },
-  inputSuffix: { marginLeft: 4, fontWeight: '700' },
-
-  autoRow: { marginTop: 6, flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' },
-  autoLabel: { fontSize: 13, fontWeight: '600', opacity: 0.8 },
-
-  radiusHint: { fontSize: 12, opacity: 0.7 },
-
-  // FAB common
-  fab: {
-    position: 'absolute',
-    right: 16,
-    backgroundColor: '#111',
-    alignItems: 'center',
-    justifyContent: 'center',
-    shadowColor: '#000', shadowOpacity: 0.2, shadowRadius: 10, shadowOffset: { width: 0, height: 6 },
-    elevation: 6, zIndex: 6
-  },
-  fabPrimary: { width: 120, height: 48, borderRadius: 14 },
-  fabCircle: { width: 54, height: 54, borderRadius: 27 },
-  fabText: { color: '#fff', fontSize: 15, fontWeight: '800' },
-
   // Dock styles
   radiusDockWrap: {
     position: 'absolute',
@@ -1371,7 +1309,6 @@ const styles = StyleSheet.create({
 
   // custom pin
   pinWrap: { alignItems: 'center' },
-  pinWrapActive: { transform: [{ scale: 1.1 }] },
   pinGlow: {
     position: 'absolute',
     width: 30,
