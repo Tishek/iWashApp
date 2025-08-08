@@ -1,0 +1,39 @@
+{
+  "expo": {
+    "name": "iWash",
+    "slug": "iwashapp",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "icon": "./assets/icon.png",
+    "splash": {
+      "image": "./assets/splash.png",
+      "resizeMode": "contain",
+      "backgroundColor": "#0B0F17",
+      "dark": {
+        "image": "./assets/splash-dark.png",
+        "resizeMode": "contain",
+        "backgroundColor": "#0B0F17"
+      }
+    },
+    "scheme": "iwash",
+    "userInterfaceStyle": "automatic",
+    
+    "ios": {
+      "supportsTablet": false,
+      "bundleIdentifier": "cz.iwash.app",
+      "infoPlist": {
+        "NSLocationWhenInUseUsageDescription": "Potřebujeme tvoji polohu, abychom našli nejbližší myčky ve tvém okolí."
+      }
+    },
+    "android": {
+      "adaptiveIcon": {
+        "foregroundImage": "./assets/adaptive-icon.png",
+        "backgroundColor": "#ffffff"
+      }
+    },
+    "web": {
+      "bundler": "metro",
+      "output": "single"
+    }
+  }
+}
