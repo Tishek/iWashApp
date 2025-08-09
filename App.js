@@ -2,13 +2,12 @@ import { StatusBar } from 'expo-status-bar';
 import React, { useEffect, useRef, useState, useMemo } from 'react';
 import {
   StyleSheet, View, Text, TouchableOpacity, Animated,
-  Dimensions, FlatList, Alert, Linking, Switch, ActivityIndicator,
-  Modal, ScrollView, useColorScheme, Image, LogBox,
+  Dimensions, FlatList, Alert, Linking, ActivityIndicator,
+  ScrollView, useColorScheme, Image, LogBox,
 } from 'react-native';
 import { Marker, PROVIDER_DEFAULT, Circle } from 'react-native-maps';
 import ClusteredMapView from 'react-native-map-clustering';
 import * as Location from 'expo-location';
-import Slider from '@react-native-community/slider';
 import { BlurView } from 'expo-blur';
 import * as Haptics from 'expo-haptics';
 import { SafeAreaProvider, useSafeAreaInsets, initialWindowMetrics } from 'react-native-safe-area-context';
@@ -26,6 +25,117 @@ import {
 } from './src/utils/constants';
 import { useSettings } from './src/hooks/useSettings';
 import { useFavorites } from './src/hooks/useFavorites';
+import SettingsScreen from './src/SettingsScreen';
+
+// --- i18n ---
+const STRINGS = {
+  cs: {
+    updating: 'Aktualizuji…',
+    settings: 'Nastavení',
+    done: 'Hotovo',
+    listTitle: 'Myčky v okolí',
+    radius: 'radius',
+    error: 'chyba',
+    filters: {
+      ALL: 'Vše',
+      CONTACT: 'Kontaktní',
+      NONCONTACT: 'Bezkontaktní',
+      FULLSERVICE: 'Full service',
+      FAV: 'Oblíbené',
+    },
+    searchCenter: 'Střed vyhledávání',
+    myLocation: 'Moje poloha',
+    mapCenter: 'Střed mapy',
+    prefNav: 'Preferovaná navigace',
+    theme: 'Vzhled',
+    defaultRadius: 'Výchozí radius',
+    defaultRadiusHint: 'Použije se při startu a když posuneš jezdec zde',
+    search: 'Hledat',
+    empty: 'Žádné výsledky pro zvolený filtr. Změň poloměr, filtr, nebo ťukni na „Hledat zde“.',
+    language: 'Jazyk',
+    langCs: 'Čeština',
+    langEn: 'English',
+    units: { km: 'km', m: 'm' },
+    open: 'Otevřeno',
+    closed: 'Zavřeno',
+    btn: { navigate: 'Navigovat' },
+    common: {
+      cancel: 'Zrušit',
+      missingKeyTitle: 'Chybí API klíč',
+      missingKeyBody: 'Přidej EXPO_PUBLIC_GOOGLE_MAPS_API_KEY do .env a restartuj.',
+      loadErrorTitle: 'Chyba načítání',
+      invalidDestinationTitle: 'Chyba',
+      invalidDestinationBody: 'Cíl nemá platnou polohu.',
+      navOpenFailTitle: 'Nejde otevřít navigaci',
+      navOpenFailBody: 'Zkus jinou aplikaci.',
+      destinationLabel: 'Cíl'
+    },
+    nav: {
+      otherApp: 'Otevřít v jiné aplikaci',
+      chooseApp: 'Vyber navigační aplikaci',
+      apple: 'Apple',
+      google: 'Google',
+      waze: 'Waze',
+      ask: 'Zeptat se',
+    },
+    themeSystem: 'Systém',
+    themeLight: 'Světlý',
+    themeDark: 'Tmavý'
+  },
+  en: {
+    updating: 'Updating…',
+    settings: 'Settings',
+    done: 'Done',
+    listTitle: 'Car washes nearby',
+    radius: 'radius',
+    error: 'error',
+    filters: {
+      ALL: 'All',
+      CONTACT: 'Contact',
+      NONCONTACT: 'Touchless',
+      FULLSERVICE: 'Full service',
+      FAV: 'Favorites',
+    },
+    searchCenter: 'Search center',
+    myLocation: 'My location',
+    mapCenter: 'Map center',
+    prefNav: 'Preferred navigation',
+    theme: 'Appearance',
+    defaultRadius: 'Default radius',
+    defaultRadiusHint: 'Used on app start and when you move the slider here',
+    search: 'Search',
+    empty: 'No results for the selected filter. Change the radius, filter, or tap “Search here”.',
+    language: 'Language',
+    langCs: 'Čeština',
+    langEn: 'English',
+    units: { km: 'km', m: 'm' },
+    open: 'Open',
+    closed: 'Closed',
+    btn: { navigate: 'Navigate' },
+    common: {
+      cancel: 'Cancel',
+      missingKeyTitle: 'Missing API key',
+      missingKeyBody: 'Add EXPO_PUBLIC_GOOGLE_MAPS_API_KEY to .env and restart.',
+      loadErrorTitle: 'Loading error',
+      invalidDestinationTitle: 'Error',
+      invalidDestinationBody: 'Destination has no valid location.',
+      navOpenFailTitle: "Can't open navigation",
+      navOpenFailBody: 'Try another app.',
+      destinationLabel: 'Destination'
+    },
+    nav: {
+      otherApp: 'Open in another app',
+      chooseApp: 'Choose a navigation app',
+      apple: 'Apple',
+      google: 'Google',
+      waze: 'Waze',
+      ask: 'Ask me',
+    },
+    themeSystem: 'System',
+    themeLight: 'Light',
+    themeDark: 'Dark'
+  },
+};
 
 const { width: SCREEN_W, height: SCREEN_H } = Dimensions.get('window');
 
@@ -55,14 +165,15 @@ function AppInner() {
     animTimerRef.current = setTimeout(() => { isAnimatingRef.current = false; }, d + 80);
   };
 
-  const { settings, saveSettings, autoReload, setAutoReload } = useSettings();
-  // Force-disable autoReload (kept in state/context for potential future use)
-  useEffect(() => {
-    if (autoReload) {
-      setAutoReload(false);
-      saveSettings({ autoReload: false });
-    }
-  }, []);
+  const { settings, saveSettings } = useSettings();
+
+  const lang = settings?.lang === 'en' ? 'en' : 'cs';
+  const t = (k, fallback) => {
+    const parts = String(k).split('.');
+    let cur = STRINGS[lang];
+    for (const p of parts) cur = cur?.[p];
+    return (typeof cur === 'string') ? cur : (fallback ?? k);
+  };
   // Safe-area insets (notch)
   const insets = useSafeAreaInsets();
   // Prevent multiple centerings from stacking
@@ -111,9 +222,6 @@ function AppInner() {
   useEffect(() => { followRef.current = followMe; }, [followMe]);
   const disableFollow = () => { followRef.current = false; setFollowMe(false); };
 
-  // auto reload (zrcadlí autoReload)
-  const autoDebounce = useRef(null);
-  const mountedRef = useRef(false);
 
   // filtry
   const [filterMode, setFilterMode] = useState('ALL'); // ALL | CONTACT | NONCONTACT | FULLSERVICE | FAV
@@ -386,7 +494,7 @@ function AppInner() {
   // fetch Places
   const searchHere = async () => {
     if (!API_KEY) {
-      Alert.alert('Chybí API klíč', 'Přidej EXPO_PUBLIC_GOOGLE_MAPS_API_KEY do .env a restartuj.');
+      Alert.alert(t('common.missingKeyTitle'), t('common.missingKeyBody'));
       return;
     }
     if (!searchCenter) return;
@@ -397,7 +505,7 @@ function AppInner() {
       setLastError(null);
       setSelectedId(null);
 
-            const base = `https://maps.googleapis.com/maps/api/place/nearbysearch/json`;
+      const base = `https://maps.googleapis.com/maps/api/place/nearbysearch/json`;
       const acc = [];
       let pageToken = null;
       let safety = 0;
@@ -472,7 +580,7 @@ function AppInner() {
     } catch (e) {
       DEV_ERROR(e);
       setLastError(String(e.message || e));
-      Alert.alert('Chyba načítání', String(e.message || e));
+      Alert.alert(t('common.loadErrorTitle'), String(e.message || e));
     } finally {
       setLoading(false);
     }
@@ -503,11 +611,11 @@ function AppInner() {
   const openNavigation = async (item, app) => {
     const loc = item?.location;
     if (!loc || typeof loc.latitude !== 'number' || typeof loc.longitude !== 'number') {
-      Alert.alert('Chyba', 'Cíl nemá platnou polohu.');
+      Alert.alert(t('common.invalidDestinationTitle'), t('common.invalidDestinationBody'));
       return;
     }
     const { latitude, longitude } = loc;
-    const label = encodeURIComponent(item?.name || 'Cíl');
+    const label = encodeURIComponent(item?.name || t('common.destinationLabel'));
 
     let url = '';
     switch (app) {
@@ -527,7 +635,7 @@ function AppInner() {
     try {
       await Linking.openURL(url);
     } catch (e) {
-      Alert.alert('Nejde otevřít navigaci', 'Zkus jinou aplikaci.');
+      Alert.alert(t('common.navOpenFailTitle'), t('common.navOpenFailBody'));
     }
   };
 
@@ -912,13 +1020,13 @@ function AppInner() {
         {loading ? (
           <>
             <ActivityIndicator size="small" />
-            <Text style={[styles.statusText, { color: P.text }]}>Aktualizuji…</Text>
+            <Text style={[styles.statusText, { color: P.text }]}>{t('updating')}</Text>
           </>
         ) : null}
         <TouchableOpacity
           onPress={() => { Haptics.selectionAsync(); setSettingsOpen(true); }}
           style={styles.gearBtn}
-          accessibilityLabel="Nastavení"
+          accessibilityLabel={t('settings')}
         >
           <Text style={[styles.gearIcon, { color: P.text }]}>⚙️</Text>
         </TouchableOpacity>
@@ -936,14 +1044,14 @@ function AppInner() {
               <Text style={styles.dockBtnTxt}>–100</Text>
             </TouchableOpacity>
 
-            <Text style={styles.dockRadius}>{radiusM} m</Text>
+            <Text style={styles.dockRadius}>{radiusM} {t('units.m')}</Text>
 
             <TouchableOpacity onPress={() => { Haptics.selectionAsync(); adjustRadius(+100); }} style={styles.dockBtn}>
               <Text style={styles.dockBtnTxt}>+100</Text>
             </TouchableOpacity>
 
             <TouchableOpacity onPress={searchHere} style={[styles.dockAction, { backgroundColor: loading ? '#666' : '#111' }]} disabled={loading}>
-              <Text style={styles.dockActionTxt}>{loading ? '…' : 'Hledat'}</Text>
+              <Text style={styles.dockActionTxt}>{loading ? '…' : t('search')}</Text>
             </TouchableOpacity>
 
             <TouchableOpacity onPress={() => { Haptics.selectionAsync(); recenter(); }} style={styles.dockCircle}>
@@ -960,10 +1068,10 @@ function AppInner() {
           const active = radiusM === m;
           return (
             <TouchableOpacity key={m}
-              onPress={()=>{ Haptics.selectionAsync(); commitRadius(m); if (autoReload) searchHere(); }}
+              onPress={()=>{ Haptics.selectionAsync(); commitRadius(m); }}
               style={[styles.quickChip, active && styles.quickChipActive]}
-              accessibilityLabel={`Radius ${km} km`}>
-              <Text style={[styles.quickChipTxt, active && styles.quickChipTxtActive]}>{km} km</Text>
+              accessibilityLabel={`${t('radius')} ${km} ${t('units.km')}`}>
+              <Text style={[styles.quickChipTxt, active && styles.quickChipTxtActive]}>{km} {t('units.km')}</Text>
             </TouchableOpacity>
           );
         })}
@@ -984,9 +1092,9 @@ function AppInner() {
           </TouchableOpacity>
 
           <View style={styles.sheetHeader}>
-            <Text style={[styles.sheetTitle, { color: P.text }]}>Myčky v okolí</Text>
+            <Text style={[styles.sheetTitle, { color: P.text }]}>{t('listTitle')}</Text>
             <Text style={[styles.sheetSubtitle, { color: P.textMute }]}>
-              {filteredPlaces.length} z {places.length} • radius {(radiusM / 1000).toFixed(1)} km{lastError ? ' • ⚠️ chyba' : ''}
+              {filteredPlaces.length} / {places.length} • {t('radius')} {(radiusM / 1000).toFixed(1)} {t('units.km')}{lastError ? ' • ⚠️ ' + t('error') : ''}
             </Text>
           </View>
 
@@ -997,11 +1105,11 @@ function AppInner() {
           contentContainerStyle={styles.filterRow}
         >
           {[
-            { key: 'ALL', label: 'Vše' },
-            { key: 'CONTACT', label: 'Kontaktní' },
-            { key: 'NONCONTACT', label: 'Bezkontaktní' },
-            { key: 'FULLSERVICE', label: 'Full service' },
-            { key: 'FAV', label: 'Oblíbené' },
+            { key: 'ALL', label: t('filters.ALL') },
+            { key: 'CONTACT', label: t('filters.CONTACT') },
+            { key: 'NONCONTACT', label: t('filters.NONCONTACT') },
+            { key: 'FULLSERVICE', label: t('filters.FULLSERVICE') },
+            { key: 'FAV', label: t('filters.FAV') },
           ].map(btn => (
             <TouchableOpacity
               key={btn.key}
@@ -1023,7 +1131,7 @@ function AppInner() {
         <View style={styles.sheetBody}>
           {filteredPlaces.length === 0 ? (
             <Text style={[styles.placeholder, { color: P.textMute }]}>
-              Žádné výsledky pro zvolený filtr. Změň poloměr, filtr, nebo ťukni na „Hledat zde“.
+              {t('empty')}
             </Text>
           ) : (
             <FlatList
@@ -1053,6 +1161,7 @@ function AppInner() {
                   onNavigatePreferred={onNavigatePreferred}
                   openNavigation={openNavigation}
                   focusPlace={focusPlace}
+                  t={t}
                 />
               )}
             />
@@ -1060,97 +1169,20 @@ function AppInner() {
         </View>
       </Animated.View>
 
-      {/* Nastavení */}
-      <Modal visible={settingsOpen} animationType="slide" presentationStyle="pageSheet" onRequestClose={() => setSettingsOpen(false)}>
-        <View style={[styles.settingsWrap, { backgroundColor: P.bg }]}> 
-          <View style={[styles.settingsHeader, { borderBottomColor: P.border }]}> 
-            <Text style={[styles.settingsTitle, { color: P.text }]}>Nastavení</Text>
-            <TouchableOpacity onPress={() => setSettingsOpen(false)} style={styles.closeBtn}><Text style={[styles.closeTxt, { color: P.text }]}>Hotovo</Text></TouchableOpacity>
-          </View>
-          <ScrollView contentContainerStyle={{ padding: 16 }}>
-
-            {/* Střed vyhledávání */}
-            <View style={[styles.setGroup, { borderTopColor: P.border, borderBottomColor: P.border }]}> 
-              <Text style={[styles.setGroupTitle, { color: P.text }]}>Střed vyhledávání</Text>
-              <View style={styles.segRow}>
-                {[
-                  { key: 'myLocation', label: 'Moje poloha' },
-                  { key: 'mapCenter', label: 'Střed mapy' },
-                ].map(btn => (
-                  <TouchableOpacity
-                    key={btn.key}
-                    onPress={() => saveSettings({ searchFrom: btn.key })}
-                    style={[styles.segBtn, { backgroundColor: (settings.searchFrom === btn.key) ? '#111' : (isDark ? '#0F1522' : '#F2F4F7'), borderColor: P.border, borderWidth: isDark ? 1 : 0 }]}
-                  >
-                    <Text style={[styles.segTxt, { color: (settings.searchFrom === btn.key) ? '#fff' : P.text }]}>{btn.label}</Text>
-                  </TouchableOpacity>
-                ))}
-              </View>
-            </View>
-
-            {/* Preferovaná navigace */}
-            <View style={styles.setGroup}>
-              <Text style={[styles.setGroupTitle, { color: P.text }]}>Preferovaná navigace</Text>
-              <View style={styles.segRow}>
-                {[
-                  { key: 'ask', label: 'Zeptat se' },
-                  { key: 'apple', label: 'Apple' },
-                  { key: 'google', label: 'Google' },
-                  { key: 'waze', label: 'Waze' },
-                ].map(btn => (
-                  <TouchableOpacity
-                    key={btn.key}
-                    onPress={() => saveSettings({ preferredNav: btn.key })}
-                    style={[styles.segBtn, { backgroundColor: (settings.preferredNav === btn.key) ? '#111' : (isDark ? '#0F1522' : '#F2F4F7'), borderColor: P.border, borderWidth: isDark ? 1 : 0 }]}
-                  >
-                    <Text style={[styles.segTxt, { color: (settings.preferredNav === btn.key) ? '#fff' : P.text }]}>{btn.label}</Text>
-                  </TouchableOpacity>
-                ))}
-              </View>
-            </View>      
-
-            {/* Výchozí radius */}
-            <View style={styles.setGroup}> 
-              <Text style={[styles.setGroupTitle, { color: P.text }]}>Výchozí radius</Text>
-              <Text style={[styles.setHint, { color: P.textMute }]}>Použije se při startu a když posuneš jezdec zde</Text>
-              <Slider
-                style={{ width: '100%', height: 36, marginTop: 8 }}
-                minimumValue={MIN_M}
-                maximumValue={MAX_M}
-                step={STEP_M}
-                value={radiusM}
-                onValueChange={(v)=>{ commitRadius(v); saveSettings({ defaultRadiusM: Math.round(v) }); }}
-                minimumTrackTintColor="#3874FF"
-                maximumTrackTintColor={isDark ? '#1E2638' : '#E6EAF2'}
-                thumbTintColor="#3874FF"
-              />
-              <Text style={[styles.setValue, { color: P.text }]}>{radiusM} m ({(radiusM/1000).toFixed(1)} km)</Text>
-            </View>
-
-            {/* Motiv vzhledu */}
-            <View style={[styles.setGroup, { borderTopColor: P.border, borderBottomColor: P.border }]}> 
-              <Text style={[styles.setGroupTitle, { color: P.text }]}>Vzhled</Text>
-              <View style={styles.segRow}>
-                {[
-                  { key: 'system', label: 'Systém' },
-                  { key: 'light', label: 'Světlý' },
-                  { key: 'dark', label: 'Tmavý' },
-                ].map(btn => (
-                  <TouchableOpacity
-                    key={btn.key}
-                    onPress={() => saveSettings({ theme: btn.key })}
-                    style={[styles.segBtn, { backgroundColor: (settings.theme === btn.key) ? '#111' : (isDark ? '#0F1522' : '#F2F4F7'), borderColor: P.border, borderWidth: isDark ? 1 : 0 }]}
-                  >
-                    <Text style={[styles.segTxt, { color: (settings.theme === btn.key) ? '#fff' : P.text }]}>{btn.label}</Text>
-                  </TouchableOpacity>
-                ))}
-              </View>
-            </View>
-
-            <View style={{ height: 40 }} />
-          </ScrollView>
-        </View>
-      </Modal>
+      <SettingsScreen
+        visible={settingsOpen}
+        onClose={() => setSettingsOpen(false)}
+        P={P}
+        isDark={isDark}
+        settings={settings}
+        saveSettings={saveSettings}
+        radiusM={radiusM}
+        commitRadius={commitRadius}
+        MIN_M={MIN_M}
+        MAX_M={MAX_M}
+        STEP_M={STEP_M}
+        t={t}
+      />
 
       <StatusBar style={isDark ? 'light' : 'dark'} />
     </View>
@@ -1268,23 +1300,6 @@ const styles = StyleSheet.create({
   placeholder: { fontSize: 14 },
 
 
-  // settings
-  settingsWrap: { flex: 1 },
-  settingsHeader: { paddingHorizontal: 16, paddingVertical: 14, borderBottomWidth: StyleSheet.hairlineWidth, flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' },
-  settingsTitle: { fontSize: 18, fontWeight: '800' },
-  closeBtn: { paddingHorizontal: 10, paddingVertical: 6, borderRadius: 8 },
-  closeTxt: { fontSize: 15, fontWeight: '800' },
-
-  setGroup: { paddingVertical: 12, borderTopWidth: StyleSheet.hairlineWidth, borderBottomWidth: StyleSheet.hairlineWidth, marginTop: 8 },
-  setGroupTitle: { fontSize: 14, fontWeight: '800', marginBottom: 8 },
-  setRow: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', paddingVertical: 12 },
-  setLabel: { fontSize: 15, fontWeight: '700' },
-  setHint: { fontSize: 12, marginTop: 4 },
-  setValue: { fontSize: 13, marginTop: 8, fontWeight: '800' },
-
-  segRow: { flexDirection: 'row', gap: 8 },
-  segBtn: { paddingHorizontal: 12, paddingVertical: 8, borderRadius: 999 },
-  segTxt: { fontSize: 12, fontWeight: '800' },
 
   // clusters
   clusterWrap: { minWidth: 34, height: 34, paddingHorizontal: 6, borderRadius: 17, alignItems: 'center', justifyContent: 'center', backgroundColor: '#111', borderWidth: 3, borderColor: '#fff', shadowColor: '#000', shadowOpacity: 0.25, shadowRadius: 6, shadowOffset: { width: 0, height: 2 } },
