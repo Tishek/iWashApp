@@ -3,7 +3,7 @@ import React, { useEffect, useRef, useState, useMemo } from 'react';
 import {
   StyleSheet, View, Text, TouchableOpacity, Animated,
   Dimensions, FlatList, Alert, Linking, Switch, ActivityIndicator,
-  Modal, ScrollView, useColorScheme, Image,
+  Modal, ScrollView, useColorScheme, Image, LogBox,
 } from 'react-native';
 import { Marker, PROVIDER_DEFAULT, Circle } from 'react-native-maps';
 import ClusteredMapView from 'react-native-map-clustering';
@@ -15,10 +15,12 @@ import { SafeAreaProvider, useSafeAreaInsets, initialWindowMetrics } from 'react
 import { distanceMeters } from './src/utils/geo';
 import { normalizeStr } from './src/utils/text';
 import { inferType } from './src/utils/inferType';
+import MarkerPin from './src/components/MarkerPin';
+import PlaceCard from './src/components/PlaceCard';
 import {
   ITEM_H, MIN_M, MAX_M, STEP_M, MAX_RESULTS,
-  PIN_SELECTED_SCALE, PIN_TOP_H, PIN_STEM_H, PIN_STEM_MARGIN, PIN_ANCHOR_OFFSET_BASE,
-  TARGET_VISIBLE_SPAN_M, METERS_PER_DEGREE_LAT, TYPE_LABEL,
+  PIN_SELECTED_SCALE, PIN_ANCHOR_OFFSET_BASE,
+  TARGET_VISIBLE_SPAN_M, METERS_PER_DEGREE_LAT,
   OVERRIDE_EXCLUDE, OVERRIDE_FULL,
   DEFAULT_SETTINGS
 } from './src/utils/constants';
@@ -28,6 +30,14 @@ import { useFavorites } from './src/hooks/useFavorites';
 const { width: SCREEN_W, height: SCREEN_H } = Dimensions.get('window');
 
 const API_KEY = process.env.EXPO_PUBLIC_GOOGLE_MAPS_API_KEY;
+// Silence transient supercluster race when a cluster id disappears during re-cluster
+LogBox.ignoreLogs(['No cluster with the specified id']);
+
+// Dev-only logger helpers (hide logs in production builds)
+const DEV_LOG   = (...args) => { if (__DEV__) { try { console.log(...args); } catch {} } };
+const DEV_WARN  = (...args) => { if (__DEV__) { try { console.warn(...args); } catch {} } };
+const DEV_INFO  = (...args) => { if (__DEV__) { try { (console.info || console.log)(...args); } catch {} } };
+const DEV_ERROR = (...args) => { if (__DEV__) { try { console.error(...args); } catch {} } };
 
 function AppInner() {
   const mapRef = useRef(null);
@@ -46,17 +56,27 @@ function AppInner() {
   };
 
   const { settings, saveSettings, autoReload, setAutoReload } = useSettings();
+  // Force-disable autoReload (kept in state/context for potential future use)
+  useEffect(() => {
+    if (autoReload) {
+      setAutoReload(false);
+      saveSettings({ autoReload: false });
+    }
+  }, []);
   // Safe-area insets (notch)
   const insets = useSafeAreaInsets();
   // Prevent multiple centerings from stacking
   const centerLockRef = useRef(false);
   // de-dupe opakovaných centerů na stejný cíl
   const lastCenterRef = useRef({ key: '', ts: 0 });
+  // Lock to avoid multiple overlapping cluster zoom sequences
+  const clusterZoomingRef = useRef(false);
+  // Deduplicate rapid double cluster taps (for the same cluster id)
+  const lastClusterPressRef = useRef({ id: null, ts: 0 });
 
   const systemScheme = useColorScheme();
 
   const [settingsOpen, setSettingsOpen] = useState(false);
-  const [pinBaseHState, setPinBaseHState] = useState(0);
 
   const [hasPermission, setHasPermission] = useState(null);
   const [region, setRegion] = useState(null);
@@ -450,27 +470,13 @@ function AppInner() {
 
       setIsExpanded(true);
     } catch (e) {
-      console.error(e);
+      DEV_ERROR(e);
       setLastError(String(e.message || e));
       Alert.alert('Chyba načítání', String(e.message || e));
     } finally {
       setLoading(false);
     }
   };
-
-  // Auto-reload při změně regionu / radiusu (s debounce)
-  useEffect(() => {
-    if (!autoReload) return;
-    if (!mountedRef.current) { mountedRef.current = true; return; }
-    if (!searchCenter) return;
-
-    clearTimeout(autoDebounce.current);
-    autoDebounce.current = setTimeout(() => {
-      searchHere();
-    }, 600);
-
-    return () => clearTimeout(autoDebounce.current);
-  }, [region, radiusM, autoReload, searchCenter]);
 
     const filteredPlaces = useMemo(() => {
     if (filterMode === 'ALL') return places;
@@ -596,72 +602,86 @@ function AppInner() {
   // small helper for async pauses
   const wait = (ms) => new Promise((res) => setTimeout(res, ms));
 
-  // Progressive zoom for clusters: one tap keeps zooming until likely unclustered
-  const progressiveClusterZoom = async (center) => {
-    const DUR = 240; // base duration per step
-    try { Haptics.selectionAsync(); } catch {}
-    disableFollow();
-
-    if (isExpanded) {
-      // When sheet is open, keep the center within the visible map area
-      await moveMarkerToVisibleCenter(center, { zoomFactor: 0.70, minDelta: 0.01, pinScale: 0, duration: DUR });
-      await wait(DUR + 120);
-      await moveMarkerToVisibleCenter(center, { zoomFactor: 0.60, minDelta: 0.01, pinScale: 0, duration: DUR });
-      await wait(DUR + 120);
-      // Final step – target about ~800–1000 m of visible height so pins usually split
-      await moveMarkerToVisibleCenter(center, {
-        targetSpanM: Math.min(800, TARGET_VISIBLE_SPAN_M),
-        minDelta: 0.006,
-        pinScale: 0,
-        duration: DUR + 60,
-      });
-    } else {
-      // When sheet is closed, zoom in around the cluster center
-      const step = async (factor) => {
-        const latDelta = Math.max(0.006, (region?.latitudeDelta || 0.04) * factor);
-        const lonDelta = Math.max(0.006, (region?.longitudeDelta || 0.04) * factor);
-        animateToRegionSafe({
-          latitude: center.latitude,
-          longitude: center.longitude,
-          latitudeDelta: latDelta,
-          longitudeDelta: lonDelta,
-        }, DUR);
-        await wait(DUR + 120);
-      };
-
-      await step(0.65);
-      await step(0.60);
-
-      // Final approach: aim for about 1000 m vertical span (or tighter)
-      const aspect = SCREEN_W / SCREEN_H;
-      const latDeltaTarget = Math.max(0.004, (TARGET_VISIBLE_SPAN_M / METERS_PER_DEGREE_LAT));
-      const lonDeltaTarget = Math.max(0.004, latDeltaTarget * aspect);
-      animateToRegionSafe({
-        latitude: center.latitude,
-        longitude: center.longitude,
-        latitudeDelta: latDeltaTarget,
-        longitudeDelta: lonDeltaTarget,
-      }, DUR + 60);
+  // Wait until map centering lock (centerLockRef) is released
+  const waitForUnlock = async (timeout = 1200, tick = 30) => {
+    const start = Date.now();
+    while (centerLockRef.current) {
+      if (Date.now() - start > timeout) break;
+      await wait(tick);
     }
   };
 
-  const renderCluster = (cluster, _onPress) => {
-    const { id, geometry, properties } = cluster;
-    const [longitude, latitude] = geometry.coordinates;
-    const count = properties.point_count;
+  // Compute edge padding for cluster fit. When the sheet is expanded,
+  // we intentionally behave like the sheet was collapsed so the map
+  // fits clusters the same way in both states (prevents over-zooming out).
+  const getClusterEdgePadding = () => {
+    const topSafe = insets?.top || 0;
+    const topOcclusion = Math.max(topSafe, topUiBottomY);
 
-    const handlePress = () => {
-      progressiveClusterZoom({ latitude, longitude });
-    };
+    // If the sheet is expanded, force bottom padding as if collapsed
+    // so behavior matches the closed state.
+    const bottomOcclusionPx = isExpanded ? SNAP_COLLAPSED : (SCREEN_H - sheetTop);
 
-    return (
-      <Marker key={`cluster-${id}`} coordinate={{ latitude, longitude }} onPress={handlePress} tracksViewChanges={false}>
-        <View style={styles.clusterWrap}>
-          <Text style={styles.clusterText}>{count}</Text>
-        </View>
-      </Marker>
-    );
+    const topPad = Math.max(16, topOcclusion + 16);
+    const bottomPad = Math.max(16, bottomOcclusionPx + 16);
+    const sidePad = 24;
+
+    return { topPad, bottomPad, sidePad };
   };
+
+
+  // Progressive zoom towards a center point. Works the same for open/closed sheet.
+  const progressiveClusterZoom = async (center) => {
+    if (!center || !mapRef.current) return;
+    if (clusterZoomingRef.current) return;
+
+    clusterZoomingRef.current = true;
+    disableFollow();
+    try { Haptics.selectionAsync(); } catch {}
+
+    try {
+      // Use the same step sequence for both states; visible-center math is handled in moveMarkerToVisibleCenter
+      const STEPS_M = [1200, 800, 550, 360, 260];
+      for (let i = 0; i < STEPS_M.length; i++) {
+        await waitForUnlock(1000);
+        await moveMarkerToVisibleCenter(center, {
+          targetSpanM: Math.min(STEPS_M[i], TARGET_VISIBLE_SPAN_M),
+          minDelta: 0.003,
+          pinScale: 0,
+          duration: 240,
+        });
+        await wait(320);
+      }
+    } finally {
+      clusterZoomingRef.current = false;
+    }
+  };
+
+  // Fallback: approximate cluster content by a pixel-radius bounding box around the cluster center
+  const collectCoordsFromBBox = (center, regionArg, pxRadius = clusterRadiusPx) => {
+    if (!center || !regionArg) return [];
+
+    const pxR = Math.max(40, Math.min(72, pxRadius)); // clamp to sane range
+    const latPerPx = (regionArg.latitudeDelta || 0.02) / SCREEN_H;
+    const lonPerPx = (regionArg.longitudeDelta || 0.02) / SCREEN_W;
+    const scale = 1.6; // widen the catchment area slightly vs. on-screen cluster radius
+    const latRadiusDeg = latPerPx * pxR * scale;
+    const lonRadiusDeg = lonPerPx * pxR * scale;
+
+    const minLat = center.latitude - latRadiusDeg;
+    const maxLat = center.latitude + latRadiusDeg;
+    const minLng = center.longitude - lonRadiusDeg;
+    const maxLng = center.longitude + lonRadiusDeg;
+
+    const coords = (filteredPlaces || [])
+      .map((p) => p?.location)
+      .filter((c) => c && typeof c.latitude === 'number' && typeof c.longitude === 'number')
+      .filter((c) => c.latitude >= minLat && c.latitude <= maxLat && c.longitude >= minLng && c.longitude <= maxLng);
+
+    DEV_LOG('🟣 [onClusterPress] bbox', { pxR, latRadiusDeg, lonRadiusDeg, inBox: coords.length });
+    return coords;
+  };
+
   return (
     <View style={[styles.container, { backgroundColor: P.bg }]}>
       {region && (
@@ -691,8 +711,132 @@ function AppInner() {
           spiralEnabled
           radius={clusterRadiusPx}
           extent={256}
-          // onClusterPress removed, handled in renderCluster
-          renderCluster={renderCluster}
+          clusterColor="#111"
+          clusterTextColor="#fff"
+          renderCluster={(cluster) => {
+            const { id, geometry, properties } = cluster || {};
+            const [lng, lat] = geometry?.coordinates || [];
+            const center = (typeof lat === 'number' && typeof lng === 'number')
+              ? { latitude: lat, longitude: lng }
+              : null;
+            const count = properties?.point_count ?? 0;
+            const clusterId = properties?.cluster_id ?? id;
+
+            const onPress = async () => {
+              if (!center) return;
+
+              disableFollow();
+              try { Haptics.selectionAsync(); } catch {}
+
+              // Helper: fit a list of coordinates into the visible map area
+              const fitCoords = (coords) => {
+                if (!coords || coords.length === 0) return false;
+                const { topPad, bottomPad, sidePad } = getClusterEdgePadding();
+                const map = mapRef.current?.getMapRef?.() || mapRef.current;
+                try {
+                  map?.fitToCoordinates(coords, {
+                    edgePadding: { top: topPad, right: sidePad, bottom: bottomPad, left: sidePad },
+                    animated: true,
+                  });
+                  DEV_LOG('🟣 [renderCluster] fitToCoordinates', { points: coords.length, topPad, bottomPad, sidePad });
+                  return true;
+                } catch (e) {
+                  DEV_LOG('🟣 [renderCluster] fitToCoordinates error', String(e?.message || e));
+                  return false;
+                }
+              };
+
+              // Map Supercluster features -> coords
+              const featuresToCoords = (features) => (features || [])
+                .map((f) => ({ latitude: f?.geometry?.coordinates?.[1], longitude: f?.geometry?.coordinates?.[0] }))
+                .filter((c) => typeof c.latitude === 'number' && typeof c.longitude === 'number');
+
+              // 1) Try precise leaves from the clustering engine
+              let coordsFromEngine = [];
+              const engine = mapRef.current?.getClusteringEngine?.();
+              if (engine && clusterId != null) {
+                try {
+                  const leaves = engine.getLeaves(clusterId, 1000, 0) || [];
+                  coordsFromEngine = featuresToCoords(leaves);
+                  DEV_LOG('🟣 [renderCluster] engine leaves', { count: coordsFromEngine.length });
+                } catch (e) {
+                  const msg = String(e?.message || e);
+                  if (msg.includes('No cluster with the specified id')) {
+                    DEV_LOG('🟣 [renderCluster] engine race (missing id) — skip leaves');
+                  } else {
+                    DEV_LOG('🟣 [renderCluster] engine leaves error', msg);
+                  }
+                }
+
+                // 2) If no leaves, try children and expand any child-clusters into their leaves
+                if (!coordsFromEngine.length) {
+                  try {
+                    const children = engine.getChildren(clusterId) || [];
+                    if (children.length) {
+                      const pointChildren = children.filter((c) => !c?.properties?.cluster);
+                      const clusterChildren = children.filter((c) => c?.properties?.cluster);
+                      coordsFromEngine = featuresToCoords(pointChildren);
+                      // Expand cluster-children cautiously; ignore missing-id errors
+                      for (const ch of clusterChildren) {
+                        const cid = ch?.properties?.cluster_id ?? ch?.id;
+                        if (cid == null) continue;
+                        try {
+                          const chLeaves = engine.getLeaves(cid, 1000, 0) || [];
+                          coordsFromEngine.push(...featuresToCoords(chLeaves));
+                        } catch (e2) {
+                          const msg2 = String(e2?.message || e2);
+                          if (!msg2.includes('No cluster with the specified id')) {
+                            DEV_LOG('🟣 [renderCluster] child leaves error', msg2);
+                          }
+                        }
+                      }
+                      DEV_LOG('🟣 [renderCluster] engine children expanded', { count: coordsFromEngine.length });
+                    }
+                  } catch (e) {
+                    const msg = String(e?.message || e);
+                    if (msg.includes('No cluster with the specified id')) {
+                      DEV_LOG('🟣 [renderCluster] engine race (missing id) — skip children');
+                    } else {
+                      DEV_LOG('🟣 [renderCluster] engine children error', msg);
+                    }
+                  }
+                }
+              } else {
+                DEV_LOG('🟣 [renderCluster] engine? false', { clusterId });
+              }
+
+              // If engine gave us real points, fit them
+              if (coordsFromEngine.length) {
+                if (fitCoords(coordsFromEngine)) return;
+              }
+
+              // 3) Approximate with a pixel-radius bbox around the cluster center (from current places)
+              const approx = collectCoordsFromBBox(center, regionRef.current || region, clusterRadiusPx);
+              if (approx.length) {
+                if (fitCoords(approx)) {
+                  DEV_LOG('🟣 [renderCluster] fitToCoordinates(bbox) used', { points: approx.length });
+                  return;
+                }
+              }
+
+              // 4) Final fallback — progressive zoom to center while keeping visible center
+              DEV_LOG('🟣 [renderCluster] fallback: progressive zoom');
+              await progressiveClusterZoom(center);
+            };
+
+            return (
+              <Marker
+                key={`cluster-${clusterId}`}
+                coordinate={center || { latitude: 0, longitude: 0 }}
+                onPress={onPress}
+                tracksViewChanges={false}
+              >
+                <View style={styles.clusterWrap}>
+                  <Text style={styles.clusterText}>{count}</Text>
+                </View>
+              </Marker>
+            );
+          }}
         >
           {searchCenter && (
             <Circle
@@ -722,16 +866,12 @@ function AppInner() {
                 cluster={selectedId === p.id ? false : true}
                 anchor={{ x: 0.5, y: 1 }}
               >
-                <Animated.View style={[styles.pinWrap, { transform: [{ scale }] }]}>
-                  {selectedId === p.id && <View style={[styles.pinGlow, { borderColor: color }]} />}
-                  <View style={[styles.pinTop, { backgroundColor: color }]} />
-                  <View style={[styles.pinStem, { backgroundColor: color }]} />
-                  {isFav(p.id) && (
-                    <View style={styles.pinFav}>
-                      <Text style={styles.pinFavTxt}>★</Text>
-                    </View>
-                  )}
-                </Animated.View>
+                <MarkerPin
+                  selected={selectedId === p.id}
+                  color={color}
+                  scale={scale}
+                  fav={isFav(p.id)}
+                />
               </Marker>
             );
           })}
@@ -774,13 +914,6 @@ function AppInner() {
             <Text style={[styles.statusText, { color: P.text }]}>Aktualizuji…</Text>
           </>
         ) : null}
-        <TouchableOpacity
-          onPress={() => { Haptics.selectionAsync(); const v = !autoReload; setAutoReload(v); saveSettings({ autoReload: v }); }}
-          style={[styles.modeBtn, { borderColor: P.border }]}
-          accessibilityLabel="Přepnout manuál/auto"
-        >
-          <Text style={[styles.modeBtnTxt, { color: P.text }]}>{autoReload ? 'Auto' : 'Manuál'}</Text>
-        </TouchableOpacity>
         <TouchableOpacity onPress={() => { Haptics.selectionAsync(); setSettingsOpen(true); }} style={styles.gearBtn} accessibilityLabel="Nastavení">
           <Text style={{ fontSize: 16, fontWeight: '900', color: P.text }}>⚙︎</Text>
         </TouchableOpacity>
@@ -904,85 +1037,18 @@ function AppInner() {
                 listRef.current?.scrollToOffset({ offset: Math.max(ITEM_H * Math.min(info.index, filteredPlaces.length - 1) - sheetTopH, 0), animated: true });
               }}
               renderItem={({ item }) => (
-                <TouchableOpacity
-                  style={[styles.card, { backgroundColor: P.surface, borderColor: P.border, borderWidth: isDark ? 1 : 0 }, selectedId === item.id && styles.cardActive]}
-                  onPress={() => { Haptics.selectionAsync(); focusPlace(item); }}
-                >
-                  <View style={{ flex: 1 }}>
-                    <View style={{ flexDirection: 'row', alignItems: 'center' }}>
-                      <View style={{ flex: 1, paddingRight: 8 }}>
-                        <Text style={[styles.cardTitle, { color: P.text }]} numberOfLines={1}>{item.name}</Text>
-                      </View>
-                      <TouchableOpacity onPress={() => toggleFav(item)} style={styles.favBtn} hitSlop={{ top: 8, left: 8, right: 8, bottom: 8 }}>
-                        <Text style={[styles.favIcon, isFav(item.id) && styles.favIconActive]}>★</Text>
-                      </TouchableOpacity>
-                    </View>
-
-                    <View style={styles.badgeRow}>
-                      <View style={[
-                        styles.badge,
-                        item.inferredType === 'NONCONTACT' ? { backgroundColor: '#E8F2FF' } :
-                        item.inferredType === 'FULLSERVICE' ? { backgroundColor: '#E9F8EF' } :
-                        item.inferredType === 'CONTACT' ? { backgroundColor: isDark ? '#222' : '#EEE' } :
-                        { backgroundColor: isDark ? '#1C2435' : '#F1F5F9' }
-                      ]}>
-                        <Text style={[
-                          styles.badgeTxt,
-                          item.inferredType === 'NONCONTACT' ? { color: '#2E90FA' } :
-                          item.inferredType === 'FULLSERVICE' ? { color: '#12B76A' } :
-                          item.inferredType === 'CONTACT' ? { color: '#111' } :
-                          { color: '#475569' }
-                        ]}>
-                          {TYPE_LABEL[item.inferredType] || TYPE_LABEL.UNKNOWN}
-                        </Text>
-                      </View>
-                    </View>
-
-                    <Text style={[styles.cardSub, { color: P.textMute }]} numberOfLines={1}>{item.address}</Text>
-
-                    <View style={styles.metaRow}>
-                      <Text style={[styles.cardMeta, { color: P.textMute }]}>
-                        {(item.distanceM >= 1000 ? (item.distanceM / 1000).toFixed(1) + ' km' : item.distanceM + ' m')}
-                        {item.rating ? ` • ★ ${item.rating} (${item.userRatingsTotal || 0})` : ''}
-                      </Text>
-                      {item.openNow !== null && (
-                        <View style={styles.openBadge}>
-                          <View style={[styles.openDot, { backgroundColor: item.openNow ? '#12B76A' : '#94A3B8' }]} />
-                          <Text style={[styles.openTxt, { color: P.textMute }]}>{item.openNow ? 'Otevřeno' : 'Zavřeno'}</Text>
-                        </View>
-                      )}
-                    </View>
-                  </View>
-
-                  <View style={styles.navRow}>
-                    {settings.preferredNav && settings.preferredNav !== 'ask' ? (
-                      <>
-                        <TouchableOpacity onPress={() => onNavigatePreferred(item)} style={styles.navBigBtn}>
-                          <Text style={styles.navBigTxt}>Navigovat</Text>
-                        </TouchableOpacity>
-                        <TouchableOpacity
-                          onPress={() => {
-                            Alert.alert('Navigovat jinam', 'Vyber aplikaci', [
-                              { text: 'Apple',  onPress: () => openNavigation(item, 'apple') },
-                              { text: 'Google', onPress: () => openNavigation(item, 'google') },
-                              { text: 'Waze',   onPress: () => openNavigation(item, 'waze') },
-                              { text: 'Zrušit', style: 'cancel' },
-                            ]);
-                          }}
-                          style={styles.navMoreBtn}
-                        >
-                          <Text style={styles.navMoreTxt}>⋯</Text>
-                        </TouchableOpacity>
-                      </>
-                    ) : (
-                      <>
-                        <TouchableOpacity onPress={() => openNavigation(item, 'apple')}  style={styles.navBtn}><Text style={styles.navTxt}>Apple</Text></TouchableOpacity>
-                        <TouchableOpacity onPress={() => openNavigation(item, 'google')} style={styles.navBtn}><Text style={styles.navTxt}>Google</Text></TouchableOpacity>
-                        <TouchableOpacity onPress={() => openNavigation(item, 'waze')}   style={styles.navBtn}><Text style={styles.navTxt}>Waze</Text></TouchableOpacity>
-                      </>
-                    )}
-                  </View>
-                </TouchableOpacity>
+                <PlaceCard
+                  item={item}
+                  selected={selectedId === item.id}
+                  isDark={isDark}
+                  P={P}
+                  settings={settings}
+                  isFav={isFav}
+                  toggleFav={toggleFav}
+                  onNavigatePreferred={onNavigatePreferred}
+                  openNavigation={openNavigation}
+                  focusPlace={focusPlace}
+                />
               )}
             />
           )}
@@ -997,17 +1063,6 @@ function AppInner() {
             <TouchableOpacity onPress={() => setSettingsOpen(false)} style={styles.closeBtn}><Text style={[styles.closeTxt, { color: P.text }]}>Hotovo</Text></TouchableOpacity>
           </View>
           <ScrollView contentContainerStyle={{ padding: 16 }}>
-            {/* Auto-reload */}
-            <View style={styles.setRow}>
-              <View style={{ flex: 1 }}>
-                <Text style={[styles.setLabel, { color: P.text }]}>Auto-reload vyhledávání</Text>
-                <Text style={[styles.setHint, { color: P.textMute }]}>Po změně mapy nebo radiusu se výsledky automaticky obnoví</Text>
-              </View>
-              <Switch
-                value={autoReload}
-                onValueChange={(v) => { setAutoReload(v); saveSettings({ autoReload: v }); }}
-              />
-            </View>
 
             {/* Střed vyhledávání */}
             <View style={[styles.setGroup, { borderTopColor: P.border, borderBottomColor: P.border }]}> 
@@ -1184,20 +1239,6 @@ const styles = StyleSheet.create({
   crosshair: { position: 'absolute', left: '50%', top: '50%', marginLeft: -4, marginTop: -4, width: 8, height: 8, borderRadius: 4, borderWidth: 1.5, borderColor: '#111', backgroundColor: 'rgba(255,255,255,0.95)' },
   crossDot: { flex: 1, borderRadius: 6 },
 
-  // custom pin
-  pinWrap: { alignItems: 'center' },
-  pinGlow: {
-    position: 'absolute',
-    width: 30,
-    height: 30,
-    borderRadius: 15,
-    borderWidth: 3,
-    opacity: 0.25,
-    top: -6,
-    left: -6,
-  },
-  pinTop: { width: 18, height: 18, borderRadius: 9, borderWidth: 3, borderColor: '#fff', shadowColor: '#111', shadowOpacity: 0.35, shadowRadius: 6, shadowOffset: { width: 0, height: 2 } },
-  pinStem: { width: 2, height: 10, marginTop: 1, borderRadius: 1 },
 
   // BottomSheet
   sheet: {
@@ -1219,34 +1260,6 @@ const styles = StyleSheet.create({
   sheetBody: { flex: 1, paddingHorizontal: 16, paddingVertical: 8 },
   placeholder: { fontSize: 14 },
 
-  // cards
-  card: { borderRadius: 14, padding: 12, flexDirection: 'row', alignItems: 'center', gap: 12 },
-  cardActive: { backgroundColor: '#EEF3FF', borderWidth: 1, borderColor: '#C9DBFF' },
-  cardTitle: { fontSize: 16, fontWeight: '800' },
-  cardSub: { fontSize: 13, marginTop: 2 },
-  cardMeta: { fontSize: 12, marginTop: 4 },
-  navRow: { flexDirection: 'row', gap: 6, marginLeft: 8 },
-  navBtn: { backgroundColor: '#111', paddingHorizontal: 10, paddingVertical: 8, borderRadius: 10 },
-  navTxt: { color: '#fff', fontSize: 12, fontWeight: '800' },
-  metaRow: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', marginTop: 4 },
-  openBadge: { flexDirection: 'row', alignItems: 'center', gap: 6 },
-  openDot: { width: 8, height: 8, borderRadius: 4 },
-  openTxt: { fontSize: 12, fontWeight: '700' },
-
-  navBigBtn: { backgroundColor: '#111', paddingHorizontal: 14, paddingVertical: 10, borderRadius: 12 },
-  navBigTxt: { color: '#fff', fontSize: 13, fontWeight: '800' },
-  navMoreBtn: { backgroundColor: '#0F172A', paddingHorizontal: 10, paddingVertical: 8, borderRadius: 10, marginLeft: 6 },
-  navMoreTxt: { color: '#fff', fontSize: 16, fontWeight: '900' },
-  badge: { paddingHorizontal: 8, paddingVertical: 4, borderRadius: 999 },
-  badgeTxt: { fontSize: 11, fontWeight: '800' },
-  badgeRow: { flexDirection: 'row', marginTop: 4 },
-
-  // favorites styles
-  favIcon: { fontSize: 18, fontWeight: '900', color: '#CBD5E1' },
-  favIconActive: { color: '#F59E0B' },
-  pinFav: { position: 'absolute', top: -10, left: -8 },
-  pinFavTxt: { fontSize: 12, fontWeight: '900', color: '#F59E0B' },
-  favBtn: { marginLeft: 8, width: 24, alignItems: 'center' },
 
   // settings
   settingsWrap: { flex: 1 },
