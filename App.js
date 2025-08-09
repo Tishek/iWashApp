@@ -899,30 +899,35 @@ function AppInner() {
       )}
 
       {/* horní pilulka */}
-      <BlurView intensity={50} tint={isDark ? 'dark' : 'light'} style={[styles.topPill, styles.glass]} onLayout={registerTopOcclusion}> 
-        <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8 }}>
+      <BlurView intensity={25} tint={isDark ? 'dark' : 'light'} style={[styles.topPill, styles.glass]} onLayout={registerTopOcclusion}> 
+        <View style={{ flexDirection: 'row', alignItems: 'center', gap: 10
+         }}>
           <Image source={require('./assets/icon.png')} style={styles.brandIcon} />
           <Text style={[styles.topPillText, { color: P.text }]}>iWash</Text>
         </View>
       </BlurView>
 
       {/* status pilulka vpravo nahoře + ⚙︎ */}
-      <BlurView intensity={50} tint={isDark ? 'dark' : 'light'} style={[styles.statusPill, styles.glass]} onLayout={registerTopOcclusion}> 
+      <BlurView intensity={25} tint={isDark ? 'dark' : 'light'} style={[styles.statusPill, styles.glass]} onLayout={registerTopOcclusion}> 
         {loading ? (
           <>
             <ActivityIndicator size="small" />
             <Text style={[styles.statusText, { color: P.text }]}>Aktualizuji…</Text>
           </>
         ) : null}
-        <TouchableOpacity onPress={() => { Haptics.selectionAsync(); setSettingsOpen(true); }} style={styles.gearBtn} accessibilityLabel="Nastavení">
-          <Text style={{ fontSize: 16, fontWeight: '900', color: P.text }}>⚙︎</Text>
+        <TouchableOpacity
+          onPress={() => { Haptics.selectionAsync(); setSettingsOpen(true); }}
+          style={styles.gearBtn}
+          accessibilityLabel="Nastavení"
+        >
+          <Text style={[styles.gearIcon, { color: P.text }]}>⚙️</Text>
         </TouchableOpacity>
       </BlurView>
 
       {/* Dock s rychlým nastavením radiusu + hledání + centrování */}
       {!isExpanded && (
         <View style={styles.radiusDockWrap}>
-          <BlurView intensity={50} tint={isDark ? 'dark' : 'light'} style={[
+          <BlurView intensity={25} tint={isDark ? 'dark' : 'light'} style={[
             styles.radiusDock,
             styles.glass,
             { borderColor: P.border, borderWidth: isDark ? 1 : 0 }
@@ -1188,7 +1193,7 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     alignItems: 'center',
     gap: 8,
-    paddingHorizontal: 12,
+    paddingHorizontal: 8,
     paddingVertical: 8,
     borderRadius: 12,
     shadowColor: '#000',
@@ -1198,8 +1203,10 @@ const styles = StyleSheet.create({
     elevation: 4,
     zIndex: 6,
   },
+  gearBtn: { marginLeft: 0, paddingHorizontal: 6, paddingVertical: 6, borderRadius: 8 },
+  gearIcon: { fontSize: 15, fontWeight: '900', transform: [{ scale: 1.5 }] },
+
   statusText: { fontSize: 13, fontWeight: '700' },
-  gearBtn: { marginLeft: 6, paddingHorizontal: 8, paddingVertical: 6, borderRadius: 8 },
   modeBtn: { paddingHorizontal: 10, paddingVertical: 6, borderRadius: 10, borderWidth: StyleSheet.hairlineWidth },
   modeBtnTxt: { fontSize: 13, fontWeight: '800' },
 
