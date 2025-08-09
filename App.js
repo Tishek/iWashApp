@@ -9,114 +9,25 @@ import { Marker, PROVIDER_DEFAULT, Circle } from 'react-native-maps';
 import ClusteredMapView from 'react-native-map-clustering';
 import * as Location from 'expo-location';
 import Slider from '@react-native-community/slider';
-import AsyncStorage from '@react-native-async-storage/async-storage';
 import { BlurView } from 'expo-blur';
 import * as Haptics from 'expo-haptics';
 import { SafeAreaProvider, useSafeAreaInsets, initialWindowMetrics } from 'react-native-safe-area-context';
+import { distanceMeters } from './src/utils/geo';
+import { normalizeStr } from './src/utils/text';
+import { inferType } from './src/utils/inferType';
+import {
+  ITEM_H, MIN_M, MAX_M, STEP_M, MAX_RESULTS,
+  PIN_SELECTED_SCALE, PIN_TOP_H, PIN_STEM_H, PIN_STEM_MARGIN, PIN_ANCHOR_OFFSET_BASE,
+  TARGET_VISIBLE_SPAN_M, METERS_PER_DEGREE_LAT, TYPE_LABEL,
+  OVERRIDE_EXCLUDE, OVERRIDE_FULL,
+  DEFAULT_SETTINGS
+} from './src/utils/constants';
+import { useSettings } from './src/hooks/useSettings';
+import { useFavorites } from './src/hooks/useFavorites';
 
 const { width: SCREEN_W, height: SCREEN_H } = Dimensions.get('window');
-const ITEM_H = 112; // odhad výšky karty + separator
-
-const MIN_M = 500;   // 0.5 km
-const MAX_M = 5000;  // 5 km
-const STEP_M = 100;
-const MAX_RESULTS = 60;
-const PIN_SELECTED_SCALE = 1.35; // scale vybraného pinu – používej všude stejnou hodnotu
-// Výška pin view v základním měřítku (px). Použije se pro kompenzaci posunu při scale animaci,
-// aby špička pinu (anchor) zůstala na stejném místě.
-
-// Geometrie pinu (musí odpovídat stylům níže)
-const PIN_TOP_H = 18;         // styles.pinTop.height
-const PIN_STEM_H = 10;        // styles.pinStem.height
-const PIN_STEM_MARGIN = 1;    // styles.pinStem.marginTop
-// Základní vzdálenost od anchoru (spodku) k centru kruhu v měřítku 1.0
-const PIN_ANCHOR_OFFSET_BASE = PIN_STEM_H + PIN_STEM_MARGIN + PIN_TOP_H / 2; // = 20 px
-
-// Cílová výška viditelné mapy v metrech po kliknutí na myčku (laditelné)
-const TARGET_VISIBLE_SPAN_M = 1000; // např. ~1.4 km vertikálně
-const METERS_PER_DEGREE_LAT = 111320; // ~m na 1° zeměpisné šířky
 
 const API_KEY = process.env.EXPO_PUBLIC_GOOGLE_MAPS_API_KEY;
-
-// --- Settings ---
-const DEFAULT_SETTINGS = {
-  autoReload: false,
-  defaultRadiusM: 3000,
-  searchFrom: 'myLocation', // 'myLocation' | 'mapCenter'
-  theme: 'system', // 'system' | 'light' | 'dark'
-  preferredNav: 'ask', // 'ask' | 'apple' | 'google' | 'waze'
-};
-const SETTINGS_KEY = 'iwash_settings_v1';
-const FAVORITES_KEY = 'iwash_favorites_v1';
-const FAVORITES_DATA_KEY = 'iwash_favorites_data_v1';
-
-// haversine v metrech
-function distanceMeters(a, b) {
-  const toRad = d => (d * Math.PI) / 180;
-  const R = 6371000;
-  const dLat = toRad(b.latitude - a.latitude);
-  const dLon = toRad(b.longitude - a.longitude);
-  const la1 = toRad(a.latitude);
-  const la2 = toRad(b.latitude);
-  const h = Math.sin(dLat/2)**2 + Math.cos(la1)*Math.cos(la2)*Math.sin(dLon/2)**2;
-  return 2 * R * Math.asin(Math.sqrt(h));
-}
-
-// normalizace textu (bez diakritiky)
-function normalizeStr(s) {
-  return (s || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '');
-}
-
-// Heuristické určení typu myčky (vylepšené, bere v potaz i adresu/vicinity)
-function inferType(name = '', types = [], address = '') {
-  const text = normalizeStr(`${name} ${(types || []).join(' ')} ${address}`).toLowerCase();
-  const typesText = ((types || []).join(' ') || '').toLowerCase();
-
-  // --- Full service (ruční mytí s obsluhou, detailing, mobilní mytí) ---
-  const FULL_BRANDS = [
-    'kk detail','kkdetail','solid car wash','solid carwash','mobilewash','wash&go','wash and go','automycka express','automyckaexpress'
-  ];
-  const FULL_GENERIC = [
-    'rucni myti','rucni cisteni','rucne','hand wash','handwash','manual wash','detailing','autodetail','cisteni interieru','myti interieru','tepovani','impregnace','voskovani','lesteni','valet','valeting','steam wash','parni myti','myti s obsluhou','mobilni myti','mobile wash'
-  ];
-
-  // --- Bezkontaktní (WAP, samoobslužné boxy) ---
-  const NONCONTACT_BRANDS = [ 'ehrle','elephant blue','elephant','bkf','sb wash','sb mycka','washbox','wash box','jetwash','jet wash' ];
-  const NONCONTACT_GENERIC = [ 'bezkontakt','bez kontakt','touchless','brushless','self service','self-service','samoobsluz','samoobsluzna','samoobsluzne','wap','vapka','pressure','box','boxy','wash point','washpoint' ];
-
-  // --- Kontaktní (automat/tunel/portál, často u čerpacích stanic) ---
-  const CONTACT_BRANDS = [ 'imo','washtec','christ' ];
-  const CONTACT_GENERIC = [
-    'automat','automatic','tunnel','tunel','rollover','portal','portalova','brush','kartac','kartace','myci linka','myci tunel',
-    'shell','mol','omv','orlen','benzina','eurooil','ono','globus','tesco'
-  ];
-
-  const countHits = (arr) => arr.reduce((acc, term) => acc + (text.includes(term) ? 1 : 0), 0);
-
-  let scoreFull = countHits(FULL_BRANDS) * 2 + countHits(FULL_GENERIC);
-  let scoreNon  = countHits(NONCONTACT_BRANDS) * 2 + countHits(NONCONTACT_GENERIC);
-  let scoreCon  = countHits(CONTACT_BRANDS) * 2 + countHits(CONTACT_GENERIC);
-
-  if (typesText.includes('gas_station')) scoreCon += 1; // pumpy -> spíš kontaktní
-
-  const max = Math.max(scoreFull, scoreNon, scoreCon);
-  if (max < 1) return 'UNKNOWN';
-
-  if (scoreFull === max) return 'FULLSERVICE';
-  if (scoreNon === max) return 'NONCONTACT';
-  return 'CONTACT';
-}
-
-const TYPE_LABEL = {
-  CONTACT: 'Kontaktní',
-  NONCONTACT: 'Bezkontaktní',
-  FULLSERVICE: 'Full service',
-  UNKNOWN: 'Neznámé'
-};
-
-// overrides a vyloučení konkrétních názvů
-const OVERRIDE_FULL = ['kk detail','solid car wash','solid carwash','mobilewash'];
-const OVERRIDE_EXCLUDE = ['auto podbabska','autopodbabska'];
 
 function AppInner() {
   const mapRef = useRef(null);
@@ -134,6 +45,7 @@ function AppInner() {
     animTimerRef.current = setTimeout(() => { isAnimatingRef.current = false; }, d + 80);
   };
 
+  const { settings, saveSettings, autoReload, setAutoReload } = useSettings();
   // Safe-area insets (notch)
   const insets = useSafeAreaInsets();
   // Prevent multiple centerings from stacking
@@ -143,8 +55,8 @@ function AppInner() {
 
   const systemScheme = useColorScheme();
 
-  const [settings, setSettings] = useState(DEFAULT_SETTINGS);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [pinBaseHState, setPinBaseHState] = useState(0);
 
   const [hasPermission, setHasPermission] = useState(null);
   const [region, setRegion] = useState(null);
@@ -172,12 +84,6 @@ function AppInner() {
   const [lastError, setLastError] = useState(null);
   const [selectedId, setSelectedId] = useState(null);
 
-  // favorites (persistováno v AsyncStorage)
-  const [favorites, setFavorites] = useState({}); // { [place_id]: true }
-
-  // uložená data oblíbených (aby byly vidět i mimo radius)
-  const [favoritesData, setFavoritesData] = useState({}); // { [id]: snapshot }
-
   // sledování polohy – follow me
   const [followMe, setFollowMe] = useState(true);
   const locSubRef = useRef(null);
@@ -185,13 +91,13 @@ function AppInner() {
   useEffect(() => { followRef.current = followMe; }, [followMe]);
   const disableFollow = () => { followRef.current = false; setFollowMe(false); };
 
-  // auto reload (zrcadlí settings.autoReload)
-  const [autoReload, setAutoReload] = useState(DEFAULT_SETTINGS.autoReload);
+  // auto reload (zrcadlí autoReload)
   const autoDebounce = useRef(null);
   const mountedRef = useRef(false);
 
   // filtry
   const [filterMode, setFilterMode] = useState('ALL'); // ALL | CONTACT | NONCONTACT | FULLSERVICE | FAV
+  const { favorites, favoritesData, isFav, toggleFav } = useFavorites();
 
   // --- Animace zvětšení vybraného pinu ---
   const pinScales = useRef({});
@@ -241,82 +147,6 @@ function AppInner() {
   useEffect(() => {
     Animated.loop(Animated.timing(pulse, { toValue: 1, duration: 1400, useNativeDriver: true })).start();
   }, [pulse]);
-
-  // --- Settings load ---
-  useEffect(() => {
-    (async () => {
-      try {
-        const raw = await AsyncStorage.getItem(SETTINGS_KEY);
-        if (raw) {
-          const parsed = { ...DEFAULT_SETTINGS, ...JSON.parse(raw) };
-          setSettings(parsed);
-          setAutoReload(!!parsed.autoReload);
-          setRadiusM(parsed.defaultRadiusM);
-        }
-      } catch {}
-    })();
-  }, []);
-
-  // --- Favorites load ---
-  useEffect(() => {
-    (async () => {
-      try {
-        const raw = await AsyncStorage.getItem(FAVORITES_KEY);
-        if (raw) setFavorites(JSON.parse(raw));
-      } catch {}
-    })();
-  }, []);
-
-    // --- Favorites DATA load ---
-  useEffect(() => {
-    (async () => {
-      try {
-        const raw = await AsyncStorage.getItem(FAVORITES_DATA_KEY);
-        if (raw) setFavoritesData(JSON.parse(raw));
-      } catch {}
-    })();
-  }, []);
-
-  const saveSettings = async (patch) => {
-    setSettings(prev => {
-      const next = { ...prev, ...patch };
-      AsyncStorage.setItem(SETTINGS_KEY, JSON.stringify(next)).catch(() => {});
-      return next;
-    });
-  };
-
-  const isFav = (id) => !!favorites[id];
-    const toggleFav = (item) => {
-    setFavorites(prev => {
-      const next = { ...prev };
-      const exists = !!next[item.id];
-      if (exists) delete next[item.id]; else next[item.id] = true;
-      AsyncStorage.setItem(FAVORITES_KEY, JSON.stringify(next)).catch(() => {});
-
-      setFavoritesData(prevData => {
-        const dataNext = { ...prevData };
-        if (exists) {
-          delete dataNext[item.id];
-        } else {
-          dataNext[item.id] = {
-            id: item.id,
-            name: item.name,
-            address: item.address,
-            location: item.location,
-            inferredType: item.inferredType,
-            rating: item.rating,
-            userRatingsTotal: item.userRatingsTotal ?? 0,
-            openNow: (typeof item.openNow === 'boolean') ? item.openNow : null,
-            distanceM: item.distanceM ?? null,
-          };
-        }
-        AsyncStorage.setItem(FAVORITES_DATA_KEY, JSON.stringify(dataNext)).catch(() => {});
-        return dataNext;
-      });
-
-      return next;
-    });
-  };
 
   const resolvedTheme = settings.theme === 'system' ? (systemScheme || 'light') : settings.theme;
   const isDark = resolvedTheme === 'dark';
@@ -397,6 +227,12 @@ function AppInner() {
     const v = clamp(Math.round(valM / STEP_M) * STEP_M, MIN_M, MAX_M);
     setRadiusM(v);
   };
+
+  useEffect(() => {
+  if (typeof settings?.defaultRadiusM === 'number') {
+    setRadiusM(settings.defaultRadiusM);
+  }
+}, [settings?.defaultRadiusM]);
 
   // cluster radius v pixelech – čím víc přiblíženo, tím menší radius
   const clusterRadiusPx = useMemo(() => {
@@ -757,23 +593,65 @@ function AppInner() {
     }, isExpanded ? 120 : 320);
   };
 
+  // small helper for async pauses
+  const wait = (ms) => new Promise((res) => setTimeout(res, ms));
+
+  // Progressive zoom for clusters: one tap keeps zooming until likely unclustered
+  const progressiveClusterZoom = async (center) => {
+    const DUR = 240; // base duration per step
+    try { Haptics.selectionAsync(); } catch {}
+    disableFollow();
+
+    if (isExpanded) {
+      // When sheet is open, keep the center within the visible map area
+      await moveMarkerToVisibleCenter(center, { zoomFactor: 0.70, minDelta: 0.01, pinScale: 0, duration: DUR });
+      await wait(DUR + 120);
+      await moveMarkerToVisibleCenter(center, { zoomFactor: 0.60, minDelta: 0.01, pinScale: 0, duration: DUR });
+      await wait(DUR + 120);
+      // Final step – target about ~800–1000 m of visible height so pins usually split
+      await moveMarkerToVisibleCenter(center, {
+        targetSpanM: Math.min(800, TARGET_VISIBLE_SPAN_M),
+        minDelta: 0.006,
+        pinScale: 0,
+        duration: DUR + 60,
+      });
+    } else {
+      // When sheet is closed, zoom in around the cluster center
+      const step = async (factor) => {
+        const latDelta = Math.max(0.006, (region?.latitudeDelta || 0.04) * factor);
+        const lonDelta = Math.max(0.006, (region?.longitudeDelta || 0.04) * factor);
+        animateToRegionSafe({
+          latitude: center.latitude,
+          longitude: center.longitude,
+          latitudeDelta: latDelta,
+          longitudeDelta: lonDelta,
+        }, DUR);
+        await wait(DUR + 120);
+      };
+
+      await step(0.65);
+      await step(0.60);
+
+      // Final approach: aim for about 1000 m vertical span (or tighter)
+      const aspect = SCREEN_W / SCREEN_H;
+      const latDeltaTarget = Math.max(0.004, (TARGET_VISIBLE_SPAN_M / METERS_PER_DEGREE_LAT));
+      const lonDeltaTarget = Math.max(0.004, latDeltaTarget * aspect);
+      animateToRegionSafe({
+        latitude: center.latitude,
+        longitude: center.longitude,
+        latitudeDelta: latDeltaTarget,
+        longitudeDelta: lonDeltaTarget,
+      }, DUR + 60);
+    }
+  };
+
   const renderCluster = (cluster, _onPress) => {
     const { id, geometry, properties } = cluster;
     const [longitude, latitude] = geometry.coordinates;
     const count = properties.point_count;
 
     const handlePress = () => {
-      try { Haptics.selectionAsync(); } catch {}
-      disableFollow();
-      if (isExpanded) {
-        // list is open → center into the visible area (avoid notch and sheet)
-        moveMarkerToVisibleCenter({ latitude, longitude }, { zoomFactor: 0.65, minDelta: 0.01, pinScale: 0 });
-      } else {
-        // list is closed → do a manual zoom-in around cluster center
-        const latDelta = Math.max(0.006, (region?.latitudeDelta || 0.04) * 0.6);
-        const lonDelta = Math.max(0.006, (region?.longitudeDelta || 0.04) * 0.6);
-        animateToRegionSafe({ latitude, longitude, latitudeDelta: latDelta, longitudeDelta: lonDelta }, 260);
-      }
+      progressiveClusterZoom({ latitude, longitude });
     };
 
     return (
@@ -784,7 +662,6 @@ function AppInner() {
       </Marker>
     );
   };
-
   return (
     <View style={[styles.container, { backgroundColor: P.bg }]}>
       {region && (
